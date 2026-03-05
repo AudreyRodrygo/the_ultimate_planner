@@ -1,21 +1,138 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from "react";
+
+const AnalyticsCharts     = lazy(() => import('./analytics-charts').then(m => ({ default: m.AnalyticsCharts })));
+const ReadingProgressPanel = lazy(() => import('./analytics-charts').then(m => ({ default: m.ReadingProgressPanel })));
+const SummaryStats         = lazy(() => import('./analytics-charts').then(m => ({ default: m.SummaryStats })));
+
+// ═══════════════════════════════════════════
+//  DEBOUNCED STORAGE WRITES
+// ═══════════════════════════════════════════
+const _pendingTimers  = new Map(); // key → timerId
+const _pendingValues  = new Map(); // key → { value, writeFn }
+const _pendingListeners = new Set();
+
+function _notifyListeners() {
+  const n = _pendingTimers.size;
+  _pendingListeners.forEach(fn => fn(n));
+}
+
+function debouncedWrite(key, value, writeFn, delay = 500) {
+  if (_pendingTimers.has(key)) clearTimeout(_pendingTimers.get(key));
+  _pendingValues.set(key, { value, writeFn });
+  const id = setTimeout(() => {
+    try { writeFn(value); } catch {}
+    _pendingTimers.delete(key);
+    _pendingValues.delete(key);
+    _notifyListeners();
+  }, delay);
+  _pendingTimers.set(key, id);
+  _notifyListeners();
+}
+
+function flushAllPending() {
+  for (const [key, { value, writeFn }] of _pendingValues) {
+    clearTimeout(_pendingTimers.get(key));
+    try { writeFn(value); } catch {}
+  }
+  _pendingTimers.clear();
+  _pendingValues.clear();
+  _notifyListeners();
+}
+window.addEventListener("beforeunload", flushAllPending);
+
+function useStoragePending() {
+  const [count, setCount] = useState(_pendingTimers.size);
+  useEffect(() => {
+    _pendingListeners.add(setCount);
+    return () => { _pendingListeners.delete(setCount); };
+  }, []);
+  return count > 0;
+}
+
+// ═══════════════════════════════════════════
+//  SYNCED STORAGE HOOK
+// ═══════════════════════════════════════════
+const SYNC_KEYS = [
+  "sp4_done_v3",
+  "game_state_v1",
+  "user_tasks_v1",
+  "user_books_v1",
+  "user_projects_v1",
+  "user_settings_v1",
+  "user_schedule_v1",
+  "work_sessions_done_v1",
+];
+
+export function useSyncedStorage() {
+  const [userId] = useState(() => {
+    try {
+      const existing = window.storage?.getItem?.("device_user_id");
+      if (existing) return existing;
+      const newId = "u_" + Date.now().toString(36);
+      window.storage?.setItem?.("device_user_id", newId);
+      return newId;
+    } catch {
+      return "u_" + Date.now().toString(36);
+    }
+  });
+
+  const syncedGet = useCallback((key) => {
+    try {
+      // Prefer shared storage, fall back to local
+      const sharedRaw = window.storage?.getItem?.(userId + "_" + key, true);
+      if (sharedRaw != null) return sharedRaw;
+    } catch {}
+    try {
+      return window.storage?.getItem?.(key) ?? null;
+    } catch {
+      return null;
+    }
+  }, [userId]);
+
+  const syncedSet = useCallback((key, value) => {
+    try {
+      window.storage?.setItem?.(key, value);                          // local
+    } catch {}
+    try {
+      window.storage?.setItem?.(userId + "_" + key, value, true);    // shared
+    } catch {}
+  }, [userId]);
+
+  const syncFromShared = useCallback((targetUserId) => {
+    let keysRestored = 0;
+    const uid = targetUserId ?? userId;
+    for (const key of SYNC_KEYS) {
+      try {
+        const value = window.storage?.getItem?.(uid + "_" + key, true);
+        if (value != null) {
+          window.storage?.setItem?.(key, value);
+          keysRestored++;
+        }
+      } catch {}
+    }
+    return { synced: true, keysRestored };
+  }, [userId]);
+
+  return { userId, syncedGet, syncedSet, syncFromShared };
+}
 
 // ═══════════════════════════════════════════
 //  USER TASKS HOOK
 // ═══════════════════════════════════════════
-export function useUserTasks() {
-  const [userTasks, setUserTasks] = useState([]);
+export function useUserTasks({ syncedGet, syncedSet } = {}) {
+  const _get = syncedGet ?? ((k) => { try { return window.storage?.getItem?.(k) ?? null; } catch { return null; } });
+  const _set = syncedSet ?? ((k, v) => { try { window.storage?.setItem?.(k, v); } catch {} });
+
+  const [userTasks, setUserTasks] = useState(() => {
+    try { const raw = _get("user_tasks_v1"); if (raw) return JSON.parse(raw); } catch {}
+    return [];
+  });
 
   useEffect(() => {
-    try {
-      const raw = window.storage?.getItem?.("user_tasks_v1");
-      if (raw) setUserTasks(JSON.parse(raw));
-    } catch {}
-  }, []);
+    try { const raw = _get("user_tasks_v1"); if (raw) setUserTasks(JSON.parse(raw)); } catch {}
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const save = (tasks) => {
-    try { window.storage?.setItem?.("user_tasks_v1", JSON.stringify(tasks)); } catch {}
-  };
+  const save = (tasks) => _set("user_tasks_v1", JSON.stringify(tasks));
 
   const addUserTask = useCallback((task) => {
     setUserTasks(prev => {
@@ -39,19 +156,20 @@ export function useUserTasks() {
 // ═══════════════════════════════════════════
 //  USER BOOKS HOOK
 // ═══════════════════════════════════════════
-export function useUserBooks() {
-  const [userBooks, setUserBooks] = useState([]);
+export function useUserBooks({ syncedGet, syncedSet } = {}) {
+  const _get = syncedGet ?? ((k) => { try { return window.storage?.getItem?.(k) ?? null; } catch { return null; } });
+  const _set = syncedSet ?? ((k, v) => { try { window.storage?.setItem?.(k, v); } catch {} });
+
+  const [userBooks, setUserBooks] = useState(() => {
+    try { const raw = _get("user_books_v1"); if (raw) return JSON.parse(raw); } catch {}
+    return [];
+  });
 
   useEffect(() => {
-    try {
-      const raw = window.storage?.getItem?.("user_books_v1");
-      if (raw) setUserBooks(JSON.parse(raw));
-    } catch {}
-  }, []);
+    try { const raw = _get("user_books_v1"); if (raw) setUserBooks(JSON.parse(raw)); } catch {}
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const save = (books) => {
-    try { window.storage?.setItem?.("user_books_v1", JSON.stringify(books)); } catch {}
-  };
+  const save = (books) => _set("user_books_v1", JSON.stringify(books));
 
   const addUserBook = useCallback((book) => {
     setUserBooks(prev => {
@@ -90,6 +208,39 @@ export function useTheme() {
   }, []);
 
   return { theme, toggleTheme };
+}
+
+// ═══════════════════════════════════════════
+//  USER SETTINGS HOOK
+// ═══════════════════════════════════════════
+const DEFAULT_SETTINGS = {
+  wakeUpTime:        7,
+  hasSportDays:      [1, 3, 5],
+  sportDuration:     1.5,
+  commuteBook:       "auto",
+  defaultHeavyStart: 10,
+};
+
+export function useUserSettings({ syncedGet, syncedSet } = {}) {
+  const _get = syncedGet ?? ((k) => { try { return window.storage?.getItem?.(k) ?? null; } catch { return null; } });
+  const _set = syncedSet ?? ((k, v) => { try { window.storage?.setItem?.(k, v); } catch {} });
+
+  const [settings, setSettings] = useState(() => {
+    try {
+      const raw = _get("user_settings_v1");
+      return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
+    } catch { return { ...DEFAULT_SETTINGS }; }
+  });
+
+  const updateSettings = useCallback((patch) => {
+    setSettings(prev => {
+      const next = { ...prev, ...patch };
+      _set("user_settings_v1", JSON.stringify(next));
+      return next;
+    });
+  }, [_set]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return { settings, updateSettings };
 }
 
 // ═══════════════════════════════════════════
@@ -204,6 +355,644 @@ export function autoScheduleTask(task, days) {
 }
 
 // ═══════════════════════════════════════════
+//  TIMELINE BUILDER
+// ═══════════════════════════════════════════
+
+/**
+ * @typedef {Object} TimelineBlock
+ * @property {string}  startTime  — "07:00"
+ * @property {string}  endTime    — "08:30"
+ * @property {"wake"|"sport"|"home_work"|"commute"|"class"|"break"|"free"} type
+ * @property {string}  label
+ * @property {string}  [sublabel]
+ * @property {number}  [opacity]
+ * @property {string}  [color]
+ * @property {string}  [taskId]
+ * @property {boolean} [isLight]
+ */
+
+/** Convert decimal hours to "HH:MM" */
+const _fmtTime = (totalMinutes) => {
+  const h = Math.floor(totalMinutes / 60) % 24;
+  const m = totalMinutes % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+};
+
+/** Parse "HH:MM" to minutes-from-midnight */
+const _parseTime = (str) => {
+  const [h, m] = str.split(":").map(Number);
+  return h * 60 + (m || 0);
+};
+
+/**
+ * Build a ordered array of TimelineBlock for a given day.
+ *
+ * @param {object} day        — entry from DAYS[]
+ * @param {object} options
+ * @param {number}   options.wakeUpTime  — wake hour (e.g. 7)
+ * @param {boolean}  options.hasSport
+ * @param {object[]} options.books       — userBooks array
+ * @param {object[]} options.tasks       — all Task objects for this day (study + work)
+ * @param {number}   options.bookIndex   — which book is up for commute reading
+ * @returns {TimelineBlock[]}
+ */
+export function buildDayTimeline(day, options) {
+  const {
+    wakeUpTime = 7,
+    hasSport = false,
+    books = [],
+    tasks = [],
+    bookIndex = 0,
+  } = options;
+
+  /** @type {TimelineBlock[]} */
+  const blocks = [];
+  let cursor = wakeUpTime * 60; // minutes from midnight
+
+  const push = (durationMin, block) => {
+    const start = cursor;
+    const end   = cursor + durationMin;
+    blocks.push({ startTime: _fmtTime(start), endTime: _fmtTime(end), ...block });
+    cursor = end;
+  };
+
+  // ── 1. Wake up ──────────────────────────────────────────────────────────
+  push(30, { type: "wake", label: "Подъём / утренние дела" });
+
+  // ── 2. Sport (optional) ─────────────────────────────────────────────────
+  if (hasSport) {
+    push(90, { type: "home_work", label: "Спорт", color: "#4ADE80" });
+  }
+
+  const hasUni = day.uni && day.uni.length > 0;
+
+  // Mutable task queue — consume as we schedule
+  const taskQueue = [...tasks];
+  const popTask = () => taskQueue.shift() ?? null;
+  const peekLightTask = () => taskQueue.find(t => !t.taskType || t.taskType === "light") ?? taskQueue[0] ?? null;
+
+  // Book for commute
+  const commuteBook = books.length > 0 ? books[bookIndex % books.length] : null;
+
+  // ── 3. No-uni day ────────────────────────────────────────────────────────
+  if (!hasUni) {
+    while (taskQueue.length > 0 && cursor < 23 * 60) {
+      const task = popTask();
+      const dur  = Math.round((task.est ?? 1.5) * 60);
+      push(dur, {
+        type:    "home_work",
+        label:   task.title,
+        color:   task.color,
+        taskId:  task.id,
+      });
+    }
+  } else {
+    // ── 4. Day with uni classes ─────────────────────────────────────────
+    const firstClassStart = _parseTime(day.uni[0].time.split("-")[0]);
+    const leaveForUni     = firstClassStart - 60; // 1h before first class
+
+    // ── 4a. Morning home_work before leaving ─────────────────────────────
+    const morningFree = leaveForUni - cursor;
+    if (morningFree >= 30 && taskQueue.length > 0) {
+      const task = popTask();
+      // Use available time up to full task estimate
+      const dur = Math.min(morningFree, Math.round((task.est ?? 1.5) * 60));
+      push(dur, {
+        type:   "home_work",
+        label:  task.title,
+        color:  task.color,
+        taskId: task.id,
+      });
+    }
+
+    // Advance to departure if we finished early
+    if (cursor < leaveForUni) cursor = leaveForUni;
+
+    // ── 4b. Commute to uni ───────────────────────────────────────────────
+    push(60, {
+      type:     "commute",
+      label:    "Дорога в универ",
+      sublabel: commuteBook ? commuteBook.title : undefined,
+      opacity:  0.6,
+      isLight:  true,
+    });
+
+    // ── 4c. Classes + breaks ─────────────────────────────────────────────
+    let lastEndMin = cursor;
+
+    for (let i = 0; i < day.uni.length; i++) {
+      const cls        = day.uni[i];
+      const clsStart   = _parseTime(cls.time.split("-")[0]);
+      const clsEnd     = _parseTime(cls.time.split("-")[1]);
+      const clsDurMin  = clsEnd - clsStart;
+
+      // ── 4d. Break between classes ──────────────────────────────────────
+      const gapMin = clsStart - lastEndMin;
+      if (gapMin > 30) {
+        cursor = lastEndMin;
+        push(gapMin, { type: "break", label: "Перерыв между парами", opacity: 0.5 });
+      }
+
+      // ── 4c. Class block ────────────────────────────────────────────────
+      cursor = clsStart;
+      const isReadable = cls.badge && (
+        cls.badge.includes("читать") || cls.badge.includes("делать дела")
+      );
+      const lightTask = isReadable ? peekLightTask() : null;
+
+      push(clsDurMin, {
+        type:     "class",
+        label:    cls.name,
+        sublabel: lightTask ? lightTask.title : (cls.badge || undefined),
+        color:    cls.badge?.includes("пропустить") ? "#FF6B6B"
+                : cls.badge?.includes("обязательно") ? "#FFA500"
+                : cls.badge?.includes("компе")       ? "#22D3EE"
+                : cls.badge?.includes("читать")      ? "#4ADE80"
+                : undefined,
+        isLight:  isReadable || undefined,
+        taskId:   lightTask?.id ?? undefined,
+      });
+
+      lastEndMin = clsEnd;
+    }
+
+    // ── 4e. Commute home ─────────────────────────────────────────────────
+    cursor = lastEndMin;
+    push(60, {
+      type:     "commute",
+      label:    "Дорога домой",
+      sublabel: commuteBook ? commuteBook.title : undefined,
+      opacity:  0.6,
+      isLight:  true,
+    });
+
+    // ── 4f. Evening home_work with remaining tasks ───────────────────────
+    while (taskQueue.length > 0 && cursor < 23 * 60) {
+      const task = popTask();
+      const dur  = Math.min(
+        Math.round((task.est ?? 1.5) * 60),
+        23 * 60 - cursor,
+      );
+      if (dur <= 0) break;
+      push(dur, {
+        type:   "home_work",
+        label:  task.title,
+        color:  task.color,
+        taskId: task.id,
+      });
+    }
+  }
+
+  // ── 5. Evening / rest ────────────────────────────────────────────────────
+  if (cursor < 23 * 60) {
+    push(23 * 60 - cursor, {
+      type:    "free",
+      label:   "Вечер / отдых",
+      opacity: 0.4,
+    });
+  }
+
+  return blocks;
+}
+
+// ═══════════════════════════════════════════
+//  PROJECTS HOOK
+// ═══════════════════════════════════════════
+export function useProjects({ syncedGet, syncedSet } = {}) {
+  const _get = syncedGet ?? ((k) => { try { return window.storage?.getItem?.(k) ?? null; } catch { return null; } });
+  const _set = syncedSet ?? ((k, v) => { try { window.storage?.setItem?.(k, v); } catch {} });
+
+  const [projects, setProjects] = useState(() => {
+    try { const raw = _get("user_projects_v1"); return raw ? JSON.parse(raw) : []; } catch { return []; }
+  });
+
+  useEffect(() => {
+    try { const raw = _get("user_projects_v1"); if (raw) setProjects(JSON.parse(raw)); } catch {}
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const save = (list) => _set("user_projects_v1", JSON.stringify(list));
+
+  const _computeTotalHours = (project) => {
+    if (project.totalHoursGoal != null) return project.totalHoursGoal;
+    if (!project.deadline) return null;
+    const weeks = Math.max(1, Math.ceil(
+      (new Date(project.deadline) - new Date(project.startDate)) / (7 * 24 * 3600 * 1000)
+    ));
+    return project.weeklyHours * weeks;
+  };
+
+  const addProject = useCallback((project) => {
+    const newProject = {
+      id:              Date.now().toString(36),
+      title:           project.title ?? "Проект",
+      emoji:           project.emoji ?? "💼",
+      color:           project.color ?? "#818CF8",
+      weeklyHours:     project.weeklyHours ?? 10,
+      taskType:        project.taskType ?? "heavy",
+      deadline:        project.deadline ?? null,
+      startDate:       project.startDate ?? new Date().toISOString().split("T")[0],
+      status:          "active",
+      completedAt:     null,
+      totalHoursGoal:  project.totalHoursGoal ?? null,
+    };
+    newProject.totalHoursGoal = _computeTotalHours(newProject);
+    setProjects(prev => {
+      const next = [...prev, newProject];
+      save(next);
+      return next;
+    });
+  }, []);
+
+  const completeProject = useCallback((id) => {
+    setProjects(prev => {
+      const next = prev.map(p => p.id === id
+        ? { ...p, status: "done", completedAt: new Date().toISOString() }
+        : p
+      );
+      save(next);
+      return next;
+    });
+  }, []);
+
+  const updateProject = useCallback((id, changes) => {
+    setProjects(prev => {
+      const next = prev.map(p => {
+        if (p.id !== id) return p;
+        const updated = { ...p, ...changes };
+        updated.totalHoursGoal = _computeTotalHours(updated);
+        return updated;
+      });
+      save(next);
+      return next;
+    });
+  }, []);
+
+  const deleteProject = useCallback((id) => {
+    setProjects(prev => {
+      const next = prev.filter(p => p.id !== id);
+      save(next);
+      return next;
+    });
+  }, []);
+
+  const activeProjects = useMemo(
+    () => projects.filter(p => p.status === "active"),
+    [projects]
+  );
+
+  return { projects, activeProjects, addProject, completeProject, updateProject, deleteProject };
+}
+
+// ═══════════════════════════════════════════
+//  RECURRING WORK
+// ═══════════════════════════════════════════
+export function useRecurringWork(userTasks = [], activeProjects = []) {
+  const [overrides, setOverrides] = useState({});
+
+  useEffect(() => {
+    try {
+      const raw = window.storage?.getItem?.("recurring_overrides_v1");
+      if (raw) setOverrides(JSON.parse(raw));
+    } catch {}
+  }, []);
+
+  // Возвращает ISO week key вида "2026-W10"
+  const getWeekKey = (dateStr) => {
+    const d = new Date(dateStr + "T00:00:00");
+    const thu = new Date(d);
+    thu.setDate(d.getDate() - ((d.getDay() + 6) % 7) + 3); // четверг той же недели (ISO)
+    const jan4 = new Date(thu.getFullYear(), 0, 4);
+    const weekNum = 1 + Math.round((thu - jan4) / 604800000);
+    return `${thu.getFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+  };
+
+  const getWeekAllocation = useCallback((weekStartDate) => {
+    const weekDates = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(weekStartDate + "T00:00:00");
+      d.setDate(d.getDate() + i);
+      return d.toISOString().split("T")[0];
+    });
+
+    const weekKey = getWeekKey(weekStartDate);
+    const result = {}; // { [projectId]: { [date]: hours } }
+
+    // Higher weeklyHours = higher priority
+    const sorted = [...activeProjects].sort((a, b) => b.weeklyHours - a.weeklyHours);
+
+    // Track hours already allocated per day across projects
+    const dayAllocated = Object.fromEntries(weekDates.map(d => [d, 0]));
+
+    for (const proj of sorted) {
+      if (proj.startDate && weekDates[6] < proj.startDate) continue;
+      if (proj.deadline  && weekDates[0] > proj.deadline)  continue;
+
+      const targetHours = overrides[weekKey]?.[proj.id] ?? proj.weeklyHours;
+
+      const dayAvail = weekDates.map((dateStr) => {
+        const dayData = DAYS.find(d => d.date === dateStr);
+        const slots   = dayData ? calcDaySlots(dayData) : null;
+        const slotH   = slots
+          ? (proj.taskType === "light" ? slots.totalLightH : slots.totalHeavyH)
+          : 8;
+
+        const taskBusyH = dayData
+          ? dayData.taskIds.reduce((sum, id) => sum + (TASK_MAP[id]?.est ?? 0), 0)
+          : 0;
+
+        const userBusyH = userTasks
+          .filter(t =>
+            (t.type === "day"      && t.date         === dateStr) ||
+            (t.type === "deadline" && t.deadlineDate  === dateStr)
+          )
+          .reduce((sum, t) => sum + (t.est ?? 0), 0);
+
+        return Math.max(0, Math.round(
+          (slotH - taskBusyH - userBusyH - dayAllocated[dateStr]) * 10
+        ) / 10);
+      });
+
+      const totalAvail = dayAvail.reduce((s, h) => s + h, 0);
+
+      const dateHours = {};
+      for (let i = 0; i < weekDates.length; i++) {
+        const avail = dayAvail[i];
+        if (avail < 1) { dateHours[weekDates[i]] = 0; continue; }
+        const proportional = totalAvail > 0 ? (avail / totalAvail) * targetHours : 0;
+        const clamped  = Math.min(6, proportional);        // max 6h per project/day
+        const rounded  = Math.round(clamped * 2) / 2;
+        const hours    = rounded < 1 ? 0 : rounded;        // min 1h session
+        dateHours[weekDates[i]] = hours;
+        dayAllocated[weekDates[i]] += hours;
+      }
+
+      result[proj.id] = dateHours;
+    }
+
+    return result; // { [projectId]: { [date]: hours } }
+  }, [overrides, userTasks, activeProjects]);
+
+  const setWeekOverride = useCallback((weekKey, workId, hours) => {
+    setOverrides(prev => {
+      const next = {
+        ...prev,
+        [weekKey]: { ...(prev[weekKey] ?? {}), [workId]: hours },
+      };
+      try { window.storage?.setItem?.("recurring_overrides_v1", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+
+  return { recurringWork: activeProjects, getWeekAllocation, setWeekOverride };
+}
+
+// ═══════════════════════════════════════════
+//  ANALYTICS HOOK
+// ═══════════════════════════════════════════
+export function useAnalytics(activeProjects = []) {
+  // ── raw storage reads ───────────────────────────────────────────
+  const [completed, setCompleted] = useState(() => {
+    try {
+      const raw = localStorage.getItem("sp4_done_v3");
+      return new Set(raw ? JSON.parse(raw) : []);
+    } catch { return new Set(); }
+  });
+
+  const [completedWorkBlocks, setCompletedWorkBlocks] = useState(() => {
+    try {
+      const raw = window.storage?.getItem?.("work_sessions_done_v1");
+      return new Set(raw ? JSON.parse(raw) : []);
+    } catch { return new Set(); }
+  });
+
+  const [overrides, setOverrides] = useState(() => {
+    try {
+      const raw = window.storage?.getItem?.("recurring_overrides_v1");
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  });
+
+  const [analyticsBooks, setAnalyticsBooks] = useState(() => {
+    try {
+      const raw = window.storage?.getItem?.("user_books_v1");
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("sp4_done_v3");
+      setCompleted(new Set(raw ? JSON.parse(raw) : []));
+    } catch {}
+    try {
+      const raw = window.storage?.getItem?.("work_sessions_done_v1");
+      setCompletedWorkBlocks(new Set(raw ? JSON.parse(raw) : []));
+    } catch {}
+    try {
+      const raw = window.storage?.getItem?.("recurring_overrides_v1");
+      if (raw) setOverrides(JSON.parse(raw));
+    } catch {}
+    try {
+      const raw = window.storage?.getItem?.("user_books_v1");
+      if (raw) setAnalyticsBooks(JSON.parse(raw));
+    } catch {}
+  }, []);
+
+  // ── computed ─────────────────────────────────────────────────────
+  return useMemo(() => {
+    // helpers (inline to avoid module-level duplication)
+    const getWeekKey = (dateStr) => {
+      const d = new Date(dateStr + "T00:00:00");
+      const thu = new Date(d);
+      thu.setDate(d.getDate() - ((d.getDay() + 6) % 7) + 3);
+      const jan4 = new Date(thu.getFullYear(), 0, 4);
+      const weekNum = 1 + Math.round((thu - jan4) / 604800000);
+      return `${thu.getFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+    };
+
+    const getWeekStart = (dateStr) => {
+      const d = new Date(dateStr + "T00:00:00");
+      d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+      return d.toISOString().split("T")[0];
+    };
+
+    // Returns allocated work hours using the same proportional logic as getWeekAllocation
+    // (sorted by weeklyHours desc, type-aware, inter-project deduction, min 1h, max 6h)
+    const getWorkHoursForDate = (work, dateStr) => {
+      const weekStart = getWeekStart(dateStr);
+      const weekDates = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(weekStart + "T00:00:00");
+        d.setDate(d.getDate() + i);
+        return d.toISOString().split("T")[0];
+      });
+      const weekKey   = getWeekKey(dateStr);
+      const sorted    = [...activeProjects].sort((a, b) => b.weeklyHours - a.weeklyHours);
+      const dayAllocated = Object.fromEntries(weekDates.map(d => [d, 0]));
+
+      for (const proj of sorted) {
+        if (proj.startDate && weekDates[6] < proj.startDate) continue;
+        if (proj.deadline  && weekDates[0] > proj.deadline)  continue;
+
+        const target = overrides[weekKey]?.[proj.id] ?? proj.weeklyHours;
+        const dayAvail = weekDates.map(dt => {
+          const dayData = DAYS.find(d => d.date === dt);
+          const slots   = dayData ? calcDaySlots(dayData) : null;
+          const slotH   = slots ? (proj.taskType === "light" ? slots.totalLightH : slots.totalHeavyH) : 8;
+          const taskBusy = dayData
+            ? dayData.taskIds.reduce((s, id) => s + (TASK_MAP[id]?.est ?? 0), 0)
+            : 0;
+          return Math.max(0, slotH - taskBusy - dayAllocated[dt]);
+        });
+        const totalAvail = dayAvail.reduce((s, h) => s + h, 0);
+        const dateHours = {};
+        for (let i = 0; i < weekDates.length; i++) {
+          const avail = dayAvail[i];
+          if (avail < 1) { dateHours[weekDates[i]] = 0; continue; }
+          const p = totalAvail > 0 ? (avail / totalAvail) * target : 0;
+          const h = Math.round(Math.min(6, p) * 2) / 2;
+          dateHours[weekDates[i]] = h < 1 ? 0 : h;
+          dayAllocated[weekDates[i]] += dateHours[weekDates[i]];
+        }
+        if (proj.id === work.id) return dateHours[dateStr] ?? 0;
+      }
+      return 0;
+    };
+
+    // ── weeklyProgress ──────────────────────────────────────────
+    const weekMap = {};
+    for (const day of DAYS) {
+      const wk = getWeekKey(day.date);
+      if (!weekMap[wk]) weekMap[wk] = [];
+      weekMap[wk].push(day);
+    }
+
+    const weeklyProgress = Object.entries(weekMap).map(([week, days]) => {
+      let learnedH = 0, targetLearnH = 0;
+      for (const day of days) {
+        for (const tid of day.taskIds) {
+          const task = TASK_MAP[tid];
+          if (!task) continue;
+          targetLearnH += task.est ?? 0;
+          if (completed.has(tid)) learnedH += task.est ?? 0;
+        }
+      }
+      let workedH = 0, targetWorkH = 0;
+      for (const work of activeProjects) {
+        targetWorkH += work.weeklyHours;
+        for (const day of days) {
+          if (completedWorkBlocks.has(`${work.id}_${day.date}`)) {
+            workedH += getWorkHoursForDate(work, day.date);
+          }
+        }
+      }
+      return {
+        week,
+        learnedH:     Math.round(learnedH     * 10) / 10,
+        workedH:      Math.round(workedH       * 10) / 10,
+        targetLearnH: Math.round(targetLearnH  * 10) / 10,
+        targetWorkH,
+      };
+    }).sort((a, b) => a.week.localeCompare(b.week));
+
+    // ── categoryProgress ────────────────────────────────────────
+    const categoryProgress = Object.entries(CAT).map(([cat, info]) => {
+      const catTasks = TASKS.filter(t => t.cat === cat);
+      const doneTasks = catTasks.filter(t => completed.has(t.id));
+      const totalH = catTasks.reduce((s, t) => s + (t.est ?? 0), 0);
+      const doneH  = doneTasks.reduce((s, t) => s + (t.est ?? 0), 0);
+      return {
+        cat, label: info.label, color: info.color,
+        total:  catTasks.length, done: doneTasks.length,
+        totalH: Math.round(totalH * 10) / 10,
+        doneH:  Math.round(doneH  * 10) / 10,
+      };
+    });
+
+    // ── dailyActivity ───────────────────────────────────────────
+    const dailyActivity = DAYS.map(day => {
+      let hoursLearned = 0, tasksCompleted = 0;
+      for (const tid of day.taskIds) {
+        if (completed.has(tid)) {
+          hoursLearned += TASK_MAP[tid]?.est ?? 0;
+          tasksCompleted++;
+        }
+      }
+      let hoursWorked = 0;
+      for (const work of activeProjects) {
+        if (completedWorkBlocks.has(`${work.id}_${day.date}`)) {
+          hoursWorked += getWorkHoursForDate(work, day.date);
+        }
+      }
+      return {
+        date: day.date,
+        hoursLearned:   Math.round(hoursLearned * 10) / 10,
+        hoursWorked:    Math.round(hoursWorked  * 10) / 10,
+        tasksCompleted,
+      };
+    });
+
+    // ── readingProgress ─────────────────────────────────────────
+    const readingProgress = analyticsBooks.map(book => {
+      const pagesPerDay = calcPagesPerDay(book);
+      const daysLeft = Math.ceil((new Date(book.deadline) - new Date()) / (1000 * 60 * 60 * 24));
+      const remaining = book.totalPages - book.readPages;
+      const onTrack = daysLeft > 0 ? remaining <= pagesPerDay * daysLeft : remaining === 0;
+      return {
+        bookId:     book.id,
+        title:      book.title,
+        totalPages: book.totalPages,
+        readPages:  book.readPages,
+        pagesPerDay,
+        onTrack,
+      };
+    });
+
+    // ── summary ─────────────────────────────────────────────────
+    const totalHoursLearned = Math.round(dailyActivity.reduce((s, d) => s + d.hoursLearned, 0) * 10) / 10;
+    const totalHoursWorked  = Math.round(dailyActivity.reduce((s, d) => s + d.hoursWorked,  0) * 10) / 10;
+
+    const activeDays = dailyActivity.filter(d => d.hoursLearned + d.hoursWorked > 0);
+    const avgDailyHours = activeDays.length > 0
+      ? Math.round((totalHoursLearned + totalHoursWorked) / activeDays.length * 10) / 10
+      : 0;
+
+    const bestDay = dailyActivity.reduce((best, d) => {
+      const h = d.hoursLearned + d.hoursWorked;
+      return h > (best?.h ?? 0) ? { date: d.date, h } : best;
+    }, null);
+    const mostProductiveDay = bestDay
+      ? (DAYS.find(d => d.date === bestDay.date)?.dow ?? bestDay.date)
+      : null;
+
+    const activeDayObjs = dailyActivity.filter(d => d.hoursLearned + d.hoursWorked > 0);
+    const mostProductiveTime = activeDayObjs.length === 0 ? null
+      : activeDayObjs.some(d => {
+          const day = DAYS.find(x => x.date === d.date);
+          return day && (!day.uni || day.uni.length === 0);
+        }) ? "утро" : "вечер";
+
+    const countableTasks = TASKS.filter(t => t.id !== "sp5_tbd");
+    const completionRate = countableTasks.length > 0
+      ? Math.round((countableTasks.filter(t => completed.has(t.id)).length / countableTasks.length) * 100)
+      : 0;
+
+    return {
+      weeklyProgress,
+      categoryProgress,
+      dailyActivity,
+      readingProgress,
+      summary: {
+        totalHoursLearned,
+        totalHoursWorked,
+        avgDailyHours,
+        mostProductiveDay,
+        mostProductiveTime,
+        completionRate,
+      },
+    };
+  }, [completed, completedWorkBlocks, overrides, analyticsBooks, activeProjects]);
+}
+
+// ═══════════════════════════════════════════
 //  GAME — LEVELS & ACHIEVEMENTS
 // ═══════════════════════════════════════════
 export const LEVELS = [
@@ -223,6 +1012,7 @@ export const ACHIEVEMENTS = [
   { id: "streak_7",        label: "7-Day Streak",    emoji: "🔥",  desc: "7 дней подряд без пропусков" },
   { id: "bookworm",        label: "Bookworm",        emoji: "📚",  desc: "Дочитать любую книгу до конца" },
   { id: "sprint_slayer",   label: "Sprint Slayer",   emoji: "⚡",  desc: "Закрыть весь спринт до дедлайна" },
+  { id: "week_warrior",    label: "Week Warrior",    emoji: "⚔️", desc: "Выполнить недельную норму EventManager (35ч) за одну неделю" },
 ];
 
 const GAME_KEY = "game_state_v1";
@@ -245,11 +1035,26 @@ const loadGame = () => {
 };
 
 const saveGame = (state) => {
-  try { localStorage.setItem(GAME_KEY, JSON.stringify(state)); } catch {}
+  debouncedWrite(GAME_KEY, state, v => localStorage.setItem(GAME_KEY, JSON.stringify(v)), 1000);
 };
 
-export function useGameState() {
-  const [gs, setGs] = useState(loadGame);
+export function useGameState({ syncedGet, syncedSet } = {}) {
+  const [gs, setGs] = useState(() => {
+    // Try shared storage first (for cross-device restore), then local
+    if (syncedGet) {
+      try {
+        const raw = syncedGet(GAME_KEY);
+        if (raw) return { ...defaultGameState(), ...JSON.parse(raw), lastUnlocked: null };
+      } catch {}
+    }
+    return loadGame();
+  });
+
+  // Dual-write helper: always local + optionally shared
+  const _saveGame = (state) => {
+    saveGame(state);
+    try { syncedSet?.(GAME_KEY, JSON.stringify(state)); } catch {}
+  };
 
   const getCurrentLevel = useCallback((xp = gs.xp) => {
     for (let i = LEVELS.length - 1; i >= 0; i--) {
@@ -269,10 +1074,10 @@ export function useGameState() {
   const addXP = useCallback((amount) => {
     setGs(prev => {
       const next = { ...prev, xp: prev.xp + amount, lastActiveDate: TODAY() };
-      saveGame(next);
+      _saveGame(next);
       return next;
     });
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const checkAndUpdateStreak = useCallback(() => {
     setGs(prev => {
@@ -285,29 +1090,29 @@ export function useGameState() {
         streak = 0;
       }
       const next = { ...prev, streak, xp };
-      saveGame(next);
+      _saveGame(next);
       return next;
     });
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const markDayComplete = useCallback((date) => {
     setGs(prev => {
       if (prev.completedDays.includes(date)) return prev;
       const next = { ...prev, xp: prev.xp + 50, completedDays: [...prev.completedDays, date] };
-      saveGame(next);
+      _saveGame(next);
       return next;
     });
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const unlockAchievement = useCallback((id) => {
     setGs(prev => {
       if (prev.unlockedAchievements.some(a => a.id === id)) return prev;
       const entry = { id, unlockedAt: new Date().toISOString() };
       const next = { ...prev, unlockedAchievements: [...prev.unlockedAchievements, entry], lastUnlocked: id };
-      saveGame(next);
+      _saveGame(next);
       return next;
     });
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const checkAchievements = useCallback((completedSet) => {
     // completedSet: Set of completed taskId strings (from TASKS)
@@ -327,10 +1132,10 @@ export function useGameState() {
       if (prev.streak < 7 || prev.unlockedAchievements.some(a => a.id === "streak_7")) return prev;
       const entry = { id: "streak_7", unlockedAt: new Date().toISOString() };
       const next = { ...prev, unlockedAchievements: [...prev.unlockedAchievements, entry], lastUnlocked: "streak_7" };
-      saveGame(next);
+      _saveGame(next);
       return next;
     });
-  }, [unlockAchievement]);
+  }, [unlockAchievement]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
     xp: gs.xp,
@@ -426,474 +1231,158 @@ const TASKS = [
 const TASK_MAP = Object.fromEntries(TASKS.map(t => [t.id, t]));
 
 // ═══════════════════════════════════════════
-//  DAY PLANS  (4–15 марта)
+//  SCHEDULE GENERATOR  (replaces static DAYS)
 // ═══════════════════════════════════════════
-const DAYS = [
-  // ── Неделя ЗНАМЕНАТЕЛЬ (2–8 марта 2026) ──
-  { date:"2026-03-04", dow:"Ср", short:"4", wn:"ЗН",
-    taskIds:["s3_1","s3_2"], freeH:7,
-    tip:"Сегодня среда ЗН. Вечерние пары (17:35–20:45) — необязательны, пропустить. Полный день дома: спорт утром 2ч, потом Sprint 3 — Habr Go-статьи. Хороший старт!",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-03-05", dow:"Чт", short:"5", wn:"ЗН",
-    taskIds:["sql_1","sql_3","sql_4"], freeH:8,
-    tip:"Свободный четверг — лаба ТКЭ (ЗН) только 19.03. Спорт 2ч утром. Большой SQL-блок: база (2sql.ru) + транзакции + EXPLAIN. Вечером — книга или отдых.",
-    uni:[]},
-  { date:"2026-03-06", dow:"Пт", short:"6", wn:"ЗН",
-    taskIds:["sql_5","sql_6","sql_2"], freeH:5,
-    tip:"Утро дома 10–14ч: индексы + B-TREE + SQL Academy тренажёр. Дорога — книга Go Паттерны. Участие специалиста (14:05, Вехов) — обязательно, можно делать дела. Интернет-технологии (15:55) — пропустить, уходишь домой.",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-03-07", dow:"Сб", short:"7", wn:"ЗН",
-    taskIds:["kf_1","kf_2"], freeH:4,
-    tip:"Утро дома 10–13ч: Kafka видео. Дорога + обе лабы Судебная КТКЭ (14:05–17:25, Крюкова) — обязательно, только пара. После ~18:30 домой — отдыхать.",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-08", dow:"Вс", short:"8", wn:"ЗН",
-    taskIds:["kf_3","kf_4","redis_1"], freeH:6,
-    tip:"🌸 8 марта — праздник! Воскресенье, пар нет. Лёгкий день: Kafka статьи + Redis в своё удовольствие. Книга по настроению.",
-    uni:[]},
-  // ── Неделя ЧИСЛИТЕЛЬ (9–15 марта 2026) ──
-  { date:"2026-03-09", dow:"Пн", short:"9", wn:"ЧС",
-    taskIds:["test_1","test_2"], freeH:5,
-    tip:"МСЗИ лекция (10:10) — пропустить. Схемотехника (11:50, Данилюк) — ОБЯЗАТЕЛЬНО, ничего не делать! Утром до вуза 9–11: интеграционные тесты. Вечером дома: моки.",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-10", dow:"Вт", short:"10", wn:"ЧС",
-    taskIds:["test_3","test_4","s3_3","s3_4"], freeH:3,
-    tip:"Большой день в универе! Участие специалиста (11:50, Вехов) — читать. Схемотехника (14:05, Данилюк) — только пара. МСЗИ сем (15:55) — пропустить. Судебная КТКЭ (17:35, ЧС, Яковлев) — обязательно, иногда читать. Утром 9–11: unit tests.",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
-    ]},
-  { date:"2026-03-11", dow:"Ср", short:"11", wn:"ЧС",
-    taskIds:["dock_1","dock_2","dock_3","dock_4"], freeH:8,
-    tip:"Вечерние пары (17:35–20:45) — необязательны, ПРОПУСТИТЬ. Продуктивный день! Большой Docker + K8s + GitLab CI/CD блок.",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-03-12", dow:"Чт", short:"12", wn:"ЧС",
-    taskIds:["dock_5","dock_6","pg_1","pg_2","pg_3"], freeH:9,
-    tip:"Свободный четверг — лаба ТКЭ (ЧС) только 23.04! Самый продуктивный день! Docker финал + GitLab pipeline статья + PostgreSQL шардирование (все три части).",
-    uni:[]},
-  { date:"2026-03-13", dow:"Пт", short:"13", wn:"ЧС",
-    taskIds:["pg_4","sd_1","sd_2","sd_3"], freeH:3,
-    tip:"Большой вечер в универе. Утром 10–14ч: PostgreSQL + System Design. Судебная КТКЭ (14:05, ЧС, Филимонов) — 50/50 читать. Интернет-технологии (15:55) — пропустить. Инет-технологии сем (17:35, ЧС, Булах) — ОБЯЗАТЕЛЬНО. ТКЭ (19:15, ЧС, Купин) — ОБЯЗАТЕЛЬНО.",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
-      {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-14", dow:"Сб", short:"14", wn:"ЧС",
-    taskIds:["sd_4","s3_5","k1"], freeH:5,
-    tip:"ТКЭ лекции 10:10–13:55 (Купин — работать на ноуте). После 14:00 дома: System Design курс Балуна + HH.ru тесты по Go и SQL. Видео Кости вечером.",
-    uni:[
-      {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-      {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-    ]},
-  { date:"2026-03-15", dow:"Вс", short:"15 🏁", wn:"ЧС",
-    taskIds:["pg_5","pg_6","k2","k3"], freeH:7,
-    tip:"🎉 ФИНАЛЬНЫЙ ДЕНЬ! Воскресенье, пар нет. Спорт утром. PostgreSQL индексы + MySQL vs PG под капотом + видео Кости #2 и #3. Финальный обзор всего пройденного. ФИНИШ!",
-    uni:[]},
+const ALL_MONTHS = ["2026-03","2026-04","2026-05"];
 
-  // ── Неделя ЗНАМЕНАТЕЛЬ (16–22 марта 2026) ──
-  { date:"2026-03-16", dow:"Пн", short:"16", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-17", dow:"Вт", short:"17", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-    ]},
-  { date:"2026-03-18", dow:"Ср", short:"18", wn:"ЗН", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-03-19", dow:"Чт", short:"19", wn:"ЗН", taskIds:[], freeH:2, tip:"",
-    uni:[
-      {time:"11:50-17:35", name:"Лаба ТКЭ Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-20", dow:"Пт", short:"20", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-03-21", dow:"Сб", short:"21", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-22", dow:"Вс", short:"22", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+// Thu ЗН dates with Лаба ТКЭ (mandatory lab)
+const LABA_DATES = new Set(["2026-03-19","2026-04-16","2026-04-30","2026-05-28"]);
 
-  // ── Неделя ЧИСЛИТЕЛЬ (23–29 марта 2026) ──
-  { date:"2026-03-23", dow:"Пн", short:"23", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-24", dow:"Вт", short:"24", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
-    ]},
-  { date:"2026-03-25", dow:"Ср", short:"25", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-03-26", dow:"Чт", short:"26", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-03-27", dow:"Пт", short:"27", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
-      {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-28", dow:"Сб", short:"28", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-      {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-    ]},
-  { date:"2026-03-29", dow:"Вс", short:"29", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+// DOW abbreviations indexed by Date.getDay() (0=Sun)
+const _DOW_RU = ["Вс","Пн","Вт","Ср","Чт","Пт","Сб"];
 
-  // ── Неделя ЗНАМЕНАТЕЛЬ (30 марта – 5 апреля 2026) ──
-  { date:"2026-03-30", dow:"Пн", short:"30", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-03-31", dow:"Вт", short:"31", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-    ]},
-  { date:"2026-04-01", dow:"Ср", short:"1", wn:"ЗН", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-04-02", dow:"Чт", short:"2", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-04-03", dow:"Пт", short:"3", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-04-04", dow:"Сб", short:"4", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-05", dow:"Вс", short:"5", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+// Base: week of 2026-03-02 (Mon) = ЗН (even = ЗН, odd = ЧС)
+const _BASE_MON_MS = new Date("2026-03-02T00:00:00").getTime();
 
-  // ── Неделя ЧИСЛИТЕЛЬ (6–12 апреля 2026) ──
-  { date:"2026-04-06", dow:"Пн", short:"6", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-07", dow:"Вт", short:"7", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
-    ]},
-  { date:"2026-04-08", dow:"Ср", short:"8", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-04-09", dow:"Чт", short:"9", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-04-10", dow:"Пт", short:"10", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
-      {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-11", dow:"Сб", short:"11", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-      {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-    ]},
-  { date:"2026-04-12", dow:"Вс", short:"12", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+function _getWn(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const dow = d.getDay();
+  const daysFromMon = dow === 0 ? 6 : dow - 1;
+  const weekDiff = Math.round((d.getTime() - daysFromMon * 86400000 - _BASE_MON_MS) / (7 * 86400000));
+  return weekDiff % 2 === 0 ? "ЗН" : "ЧС";
+}
 
-  // ── Неделя ЗНАМЕНАТЕЛЬ (13–19 апреля 2026) ──
-  { date:"2026-04-13", dow:"Пн", short:"13", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-14", dow:"Вт", short:"14", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-    ]},
-  { date:"2026-04-15", dow:"Ср", short:"15", wn:"ЗН", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-04-16", dow:"Чт", short:"16", wn:"ЗН", taskIds:[], freeH:2, tip:"",
-    uni:[
-      {time:"11:50-17:35", name:"Лаба ТКЭ Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-17", dow:"Пт", short:"17", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-04-18", dow:"Сб", short:"18", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-19", dow:"Вс", short:"19", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+function _getDaySchedule(dateStr, dow, wn) {
+  if (LABA_DATES.has(dateStr)) return {
+    uni: [{time:"11:50-17:35", name:"Лаба ТКЭ Купин", badge:"обязательно!"}], freeH: 2,
+  };
+  switch (dow) {
+    case "Пн": return {
+      uni: [
+        {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
+        {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
+      ], freeH: wn === "ЧС" ? 5 : 8,
+    };
+    case "Вт": return wn === "ЧС" ? {
+      uni: [
+        {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
+        {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
+        {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
+        {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
+      ], freeH: 4,
+    } : {
+      uni: [
+        {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
+        {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
+        {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
+      ], freeH: 8,
+    };
+    case "Ср": return {
+      uni: [
+        {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
+        {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
+      ], freeH: 4,
+    };
+    case "Чт": return { uni: [], freeH: 8 };
+    case "Пт": return wn === "ЧС" ? {
+      uni: [
+        {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
+        {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
+        {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
+        {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
+      ], freeH: 4,
+    } : {
+      uni: [
+        {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
+        {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
+      ], freeH: 5,
+    };
+    case "Сб": return wn === "ЧС" ? {
+      uni: [
+        {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
+        {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
+      ], freeH: 5,
+    } : {
+      uni: [
+        {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
+        {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
+      ], freeH: 5,
+    };
+    default: return { uni: [], freeH: 8 }; // Sun
+  }
+}
 
-  // ── Неделя ЧИСЛИТЕЛЬ (20–26 апреля 2026) ──
-  { date:"2026-04-20", dow:"Пн", short:"20", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-21", dow:"Вт", short:"21", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
-    ]},
-  { date:"2026-04-22", dow:"Ср", short:"22", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-04-23", dow:"Чт", short:"23", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-04-24", dow:"Пт", short:"24", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
-      {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-25", dow:"Сб", short:"25", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-      {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-    ]},
-  { date:"2026-04-26", dow:"Вс", short:"26", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+// Overrides for early March: custom taskIds, tips, and non-standard freeH
+const _OVERRIDES = {
+  "2026-03-04": { taskIds:["s3_1","s3_2"], freeH:7,
+    tip:"Сегодня среда ЗН. Вечерние пары (17:35–20:45) — необязательны, пропустить. Полный день дома: спорт утром 2ч, потом Sprint 3 — Habr Go-статьи. Хороший старт!" },
+  "2026-03-05": { taskIds:["sql_1","sql_3","sql_4"],
+    tip:"Свободный четверг — лаба ТКЭ (ЗН) только 19.03. Спорт 2ч утром. Большой SQL-блок: база (2sql.ru) + транзакции + EXPLAIN. Вечером — книга или отдых." },
+  "2026-03-06": { taskIds:["sql_5","sql_6","sql_2"],
+    tip:"Утро дома 10–14ч: индексы + B-TREE + SQL Academy тренажёр. Дорога — книга Go Паттерны. Участие специалиста (14:05, Вехов) — обязательно, можно делать дела. Интернет-технологии (15:55) — пропустить, уходишь домой." },
+  "2026-03-07": { taskIds:["kf_1","kf_2"], freeH:4,
+    tip:"Утро дома 10–13ч: Kafka видео. Дорога + обе лабы Судебная КТКЭ (14:05–17:25, Крюкова) — обязательно, только пара. После ~18:30 домой — отдыхать." },
+  "2026-03-08": { taskIds:["kf_3","kf_4","redis_1"], freeH:6,
+    tip:"🌸 8 марта — праздник! Воскресенье, пар нет. Лёгкий день: Kafka статьи + Redis в своё удовольствие. Книга по настроению." },
+  "2026-03-09": { taskIds:["test_1","test_2"],
+    tip:"МСЗИ лекция (10:10) — пропустить. Схемотехника (11:50, Данилюк) — ОБЯЗАТЕЛЬНО, ничего не делать! Утром до вуза 9–11: интеграционные тесты. Вечером дома: моки." },
+  "2026-03-10": { taskIds:["test_3","test_4","s3_3","s3_4"], freeH:3,
+    tip:"Большой день в универе! Участие специалиста (11:50, Вехов) — читать. Схемотехника (14:05, Данилюк) — только пара. МСЗИ сем (15:55) — пропустить. Судебная КТКЭ (17:35, ЧС, Яковлев) — обязательно, иногда читать. Утром 9–11: unit tests." },
+  "2026-03-11": { taskIds:["dock_1","dock_2","dock_3","dock_4"], freeH:8,
+    tip:"Вечерние пары (17:35–20:45) — необязательны, ПРОПУСТИТЬ. Продуктивный день! Большой Docker + K8s + GitLab CI/CD блок." },
+  "2026-03-12": { taskIds:["dock_5","dock_6","pg_1","pg_2","pg_3"], freeH:9,
+    tip:"Свободный четверг — лаба ТКЭ (ЧС) только 23.04! Самый продуктивный день! Docker финал + GitLab pipeline статья + PostgreSQL шардирование (все три части)." },
+  "2026-03-13": { taskIds:["pg_4","sd_1","sd_2","sd_3"], freeH:3,
+    tip:"Большой вечер в универе. Утром 10–14ч: PostgreSQL + System Design. Судебная КТКЭ (14:05, ЧС, Филимонов) — 50/50 читать. Интернет-технологии (15:55) — пропустить. Инет-технологии сем (17:35, ЧС, Булах) — ОБЯЗАТЕЛЬНО. ТКЭ (19:15, ЧС, Купин) — ОБЯЗАТЕЛЬНО." },
+  "2026-03-14": { taskIds:["sd_4","s3_5","k1"],
+    tip:"ТКЭ лекции 10:10–13:55 (Купин — работать на ноуте). После 14:00 дома: System Design курс Балуна + HH.ru тесты по Go и SQL. Видео Кости вечером." },
+  "2026-03-15": { taskIds:["pg_5","pg_6","k2","k3"], freeH:7, short:"15 🏁",
+    tip:"🎉 ФИНАЛЬНЫЙ ДЕНЬ! Воскресенье, пар нет. Спорт утром. PostgreSQL индексы + MySQL vs PG под капотом + видео Кости #2 и #3. Финальный обзор всего пройденного. ФИНИШ!" },
+};
 
-  // ── Неделя ЗНАМЕНАТЕЛЬ (27 апреля – 3 мая 2026) ──
-  { date:"2026-04-27", dow:"Пн", short:"27", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-04-28", dow:"Вт", short:"28", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-    ]},
-  { date:"2026-04-29", dow:"Ср", short:"29", wn:"ЗН", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-04-30", dow:"Чт", short:"30", wn:"ЗН", taskIds:[], freeH:2, tip:"",
-    uni:[
-      {time:"11:50-17:35", name:"Лаба ТКЭ Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-01", dow:"Пт", short:"1", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-05-02", dow:"Сб", short:"2", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-03", dow:"Вс", short:"3", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
+function generateDays(yearMonth) {
+  const [year, month] = yearMonth.split("-").map(Number);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const result = [];
+  for (let day = 1; day <= daysInMonth; day++) {
+    const date = `${year}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+    const d = new Date(date + "T00:00:00");
+    const dow = _DOW_RU[d.getDay()];
+    const wn = _getWn(date);
+    const { uni, freeH: baseFreeH } = _getDaySchedule(date, dow, wn);
+    const ov = _OVERRIDES[date] ?? {};
+    result.push({
+      date, dow,
+      short: ov.short ?? String(day),
+      wn,
+      taskIds: ov.taskIds ?? [],
+      freeH: ov.freeH ?? baseFreeH,
+      tip: ov.tip ?? "",
+      uni,
+    });
+  }
+  return result;
+}
 
-  // ── Неделя ЧИСЛИТЕЛЬ (4–10 мая 2026) ──
-  { date:"2026-05-04", dow:"Пн", short:"4", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-05", dow:"Вт", short:"5", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
-    ]},
-  { date:"2026-05-06", dow:"Ср", short:"6", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-05-07", dow:"Чт", short:"7", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-05-08", dow:"Пт", short:"8", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
-      {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-09", dow:"Сб", short:"9", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-      {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-    ]},
-  { date:"2026-05-10", dow:"Вс", short:"10", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-
-  // ── Неделя ЗНАМЕНАТЕЛЬ (11–17 мая 2026) ──
-  { date:"2026-05-11", dow:"Пн", short:"11", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-12", dow:"Вт", short:"12", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-    ]},
-  { date:"2026-05-13", dow:"Ср", short:"13", wn:"ЗН", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-05-14", dow:"Чт", short:"14", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-05-15", dow:"Пт", short:"15", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-05-16", dow:"Сб", short:"16", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-17", dow:"Вс", short:"17", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-
-  // ── Неделя ЧИСЛИТЕЛЬ (18–24 мая 2026) ──
-  { date:"2026-05-18", dow:"Пн", short:"18", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-19", dow:"Вт", short:"19", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"иногда читать"},
-    ]},
-  { date:"2026-05-20", dow:"Ср", short:"20", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-05-21", dow:"Чт", short:"21", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-  { date:"2026-05-22", dow:"Пт", short:"22", wn:"ЧС", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (сем.) Филимонов", badge:"50/50 читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-      {time:"17:35-19:05", name:"Интернет технологии (сем.) Булах", badge:"обязательно!"},
-      {time:"19:15-20:45", name:"ТКЭ (сем.) Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-23", dow:"Сб", short:"23", wn:"ЧС", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-      {time:"11:50-13:55", name:"ТКЭ (лекция) Купин", badge:"работать на компе"},
-    ]},
-  { date:"2026-05-24", dow:"Вс", short:"24", wn:"ЧС", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-
-  // ── Неделя ЗНАМЕНАТЕЛЬ (25–31 мая 2026) ──
-  { date:"2026-05-25", dow:"Пн", short:"25", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"10:10-11:40", name:"МСЗИ (лекция) Филиппов", badge:"пропустить"},
-      {time:"11:50-13:55", name:"Схемотехника (лекция) Данилюк", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-26", dow:"Вт", short:"26", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[
-      {time:"11:50-13:55", name:"Участие специалиста (сем.) Вехов", badge:"читать"},
-      {time:"14:05-15:35", name:"Схемотехника (сем.) Данилюк", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"МСЗИ (сем.) Филиппов", badge:"пропустить"},
-    ]},
-  { date:"2026-05-27", dow:"Ср", short:"27", wn:"ЗН", taskIds:[], freeH:4, tip:"",
-    uni:[
-      {time:"17:35-19:05", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-      {time:"19:15-20:45", name:"Судебная КТКЭ (лекция) Яковлев", badge:"пропустить"},
-    ]},
-  { date:"2026-05-28", dow:"Чт", short:"28", wn:"ЗН", taskIds:[], freeH:2, tip:"",
-    uni:[
-      {time:"11:50-17:35", name:"Лаба ТКЭ Купин", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-29", dow:"Пт", short:"29", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Участие специалиста (лекция) Вехов", badge:"читать"},
-      {time:"15:55-17:25", name:"Интернет технологии (лекция)", badge:"пропустить"},
-    ]},
-  { date:"2026-05-30", dow:"Сб", short:"30", wn:"ЗН", taskIds:[], freeH:5, tip:"",
-    uni:[
-      {time:"14:05-15:35", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-      {time:"15:55-17:25", name:"Судебная КТКЭ (лаб.) Крюкова", badge:"обязательно!"},
-    ]},
-  { date:"2026-05-31", dow:"Вс", short:"31", wn:"ЗН", taskIds:[], freeH:8, tip:"",
-    uni:[]},
-];
+// Full range used by hooks that need all months
+const DAYS = ALL_MONTHS.flatMap(m => generateDays(m));
 
 // ═══════════════════════════════════════════
 //  BADGE COLORS
 // ═══════════════════════════════════════════
 const badgeStyle = (badge, theme) => {
-  const m = theme === "light" ? 1.5 : 1;
-  if (badge.includes("пропустить")) return { bg:`rgba(255,107,107,${0.12*m})`, color:"#FF6B6B" };
-  if (badge.includes("обязательно")) return { bg:`rgba(255,165,0,${0.15*m})`, color:"#FFA500" };
-  if (badge.includes("50/50") || badge.includes("иногда")) return { bg:`rgba(253,224,71,${0.12*m})`, color:"#FDE047" };
-  if (badge.includes("компе")) return { bg:`rgba(34,211,238,${0.12*m})`, color:"#22D3EE" };
-  return { bg:`rgba(74,222,128,${0.12*m})`, color:"#4ADE80" }; // читать
+  if (theme === "light") {
+    if (badge.includes("пропустить")) return { bg:"rgba(232,180,192,0.25)", color:"#A03050" };
+    if (badge.includes("обязательно")) return { bg:"rgba(240,196,176,0.3)", color:"#B05830" };
+    if (badge.includes("50/50") || badge.includes("иногда")) return { bg:"rgba(184,168,216,0.25)", color:"#6040A0" };
+    if (badge.includes("компе")) return { bg:"rgba(168,200,232,0.3)", color:"#304E80" };
+    return { bg:"rgba(168,216,204,0.3)", color:"#2A7A68" }; // читать
+  }
+  if (badge.includes("пропустить")) return { bg:"rgba(255,107,107,0.12)", color:"#FF6B6B" };
+  if (badge.includes("обязательно")) return { bg:"rgba(255,165,0,0.15)", color:"#FFA500" };
+  if (badge.includes("50/50") || badge.includes("иногда")) return { bg:"rgba(253,224,71,0.12)", color:"#FDE047" };
+  if (badge.includes("компе")) return { bg:"rgba(34,211,238,0.12)", color:"#22D3EE" };
+  return { bg:"rgba(74,222,128,0.12)", color:"#4ADE80" }; // читать
 };
 
 // ═══════════════════════════════════════════
@@ -904,7 +1393,7 @@ const LIGHT_CATS = new Set(["sprint3", "go_extra", "sql", "kafka", "redis"]);
 const HEAVY_CATS = new Set(["testing", "docker", "sysdesign", "sprint5"]);
 const getAutoTaskType = (cat) => LIGHT_CATS.has(cat) ? "light" : HEAVY_CATS.has(cat) ? "heavy" : null;
 
-function AddTaskModal({ isOpen, onClose, onSave, categories }) {
+const AddTaskModal = React.memo(function AddTaskModal({ isOpen, onClose, onSave, categories }) {
   const [form, setForm] = useState(EMPTY_FORM);
   const [manualType, setManualType] = useState("light");
   const [pendingTask, setPendingTask] = useState(null);
@@ -1078,14 +1567,14 @@ function AddTaskModal({ isOpen, onClose, onSave, categories }) {
       />
     </>
   );
-}
+});
 
 // ═══════════════════════════════════════════
 //  ADD BOOK MODAL
 // ═══════════════════════════════════════════
 const EMPTY_BOOK_FORM = { title:"", totalPages:"", readPages:"0", deadline:"", readingType:"оба варианта", pagesPerHour:"30" };
 
-function AddBookModal({ isOpen, onClose, onSave }) {
+const AddBookModal = React.memo(function AddBookModal({ isOpen, onClose, onSave }) {
   const [form, setForm] = useState(EMPTY_BOOK_FORM);
 
   if (!isOpen) return null;
@@ -1200,7 +1689,7 @@ function AddBookModal({ isOpen, onClose, onSave }) {
       </div>
     </div>
   );
-}
+});
 
 // ═══════════════════════════════════════════
 //  SCHEDULE PREVIEW MODAL
@@ -1208,7 +1697,7 @@ function AddBookModal({ isOpen, onClose, onSave }) {
 const MONTHS_RU = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
 const DAYS_RU   = ["Вс","Пн","Вт","Ср","Чт","Пт","Сб"];
 
-function SchedulePreviewModal({ isOpen, onClose, onConfirm, schedule, task }) {
+const SchedulePreviewModal = React.memo(function SchedulePreviewModal({ isOpen, onClose, onConfirm, schedule, task }) {
   const [rows, setRows] = useState([]);
 
   useEffect(() => {
@@ -1319,12 +1808,180 @@ function SchedulePreviewModal({ isOpen, onClose, onConfirm, schedule, task }) {
       </div>
     </div>
   );
-}
+});
+
+// ═══════════════════════════════════════════
+//  ADD PROJECT MODAL
+// ═══════════════════════════════════════════
+const PROJECT_COLORS = ["#22D3EE","#4ADE80","#818CF8","#F9A8D4","#FFD93D","#FF8C42","#C084FC","#FF6B6B"];
+const TODAY_STR = new Date().toISOString().split("T")[0];
+const EMPTY_PROJECT_FORM = {
+  title: "", emoji: "💻", color: "#22D3EE",
+  weeklyHours: "35", taskType: "heavy",
+  noDeadline: false, deadline: "",
+  startDate: TODAY_STR,
+};
+
+const AddProjectModal = React.memo(function AddProjectModal({ isOpen, onClose, onSave }) {
+  const [form, setForm] = useState(EMPTY_PROJECT_FORM);
+
+  if (!isOpen) return null;
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const wh    = Math.max(1, parseFloat(form.weeklyHours) || 0);
+  const today = new Date();
+  const deadlineDate = form.deadline ? new Date(form.deadline + "T00:00:00") : null;
+  const weeksLeft = deadlineDate
+    ? Math.max(1, Math.ceil((deadlineDate - today) / (7 * 24 * 3600 * 1000)))
+    : null;
+  const totalH   = weeksLeft ? Math.round(wh * weeksLeft) : null;
+  const hoursDay = Math.round((wh / 7) * 10) / 10;
+  const lowTime  = !form.noDeadline && weeksLeft && totalH < 40;
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!form.title.trim()) return;
+    onSave({
+      title:       form.title.trim(),
+      emoji:       form.emoji || "💻",
+      color:       form.color,
+      weeklyHours: wh,
+      taskType:    form.taskType,
+      deadline:    form.noDeadline ? null : (form.deadline || null),
+      startDate:   form.startDate || TODAY_STR,
+      totalHoursGoal: totalH,
+    });
+    setForm(EMPTY_PROJECT_FORM);
+    onClose();
+  };
+
+  const inp = {
+    background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:6,
+    color:"var(--text-primary)", fontSize:12, padding:"6px 10px", width:"100%",
+    fontFamily:"'IBM Plex Mono','Fira Code',monospace", outline:"none", boxSizing:"border-box",
+  };
+  const lbl = { fontSize:9, letterSpacing:2, color:"var(--text-faint)", display:"block", marginBottom:4, marginTop:12 };
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, zIndex:1000,
+      background:"rgba(7,7,15,0.85)", display:"flex",
+      alignItems:"center", justifyContent:"center", padding:20,
+    }} onClick={onClose}>
+      <div style={{
+        background:"var(--bg-elevated)", border:"1px solid var(--border)", borderRadius:12,
+        padding:24, width:"100%", maxWidth:440, maxHeight:"90vh", overflowY:"auto",
+        fontFamily:"'IBM Plex Mono','Fira Code',monospace",
+        boxShadow:"var(--shadow-elevated)",
+      }} onClick={e => e.stopPropagation()}>
+
+        <div style={{ fontSize:9, letterSpacing:4, color:"var(--text-faint)", marginBottom:2 }}>НОВЫЙ ПРОЕКТ</div>
+        <div style={{ fontFamily:"'IBM Plex Sans'", fontWeight:700, fontSize:16, color:"var(--text-primary)", marginBottom:16 }}>
+          Создать проект
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          {/* Row: emoji + title */}
+          <label style={lbl}>НАЗВАНИЕ *</label>
+          <div style={{ display:"flex", gap:8 }}>
+            <input style={{ ...inp, width:52, textAlign:"center", fontSize:18, padding:"4px 6px", flexShrink:0 }}
+              value={form.emoji} maxLength={2}
+              onChange={e => set("emoji", e.target.value)} />
+            <input style={{ ...inp, flex:1 }}
+              value={form.title} onChange={e => set("title", e.target.value)}
+              placeholder="Название проекта" required />
+          </div>
+
+          {/* Color */}
+          <label style={lbl}>ЦВЕТ</label>
+          <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+            {PROJECT_COLORS.map(c => (
+              <div key={c} onClick={() => set("color", c)} style={{
+                width:24, height:24, borderRadius:"50%", background:c, cursor:"pointer",
+                outline: form.color === c ? `2px solid ${c}` : "none",
+                outlineOffset:2, flexShrink:0,
+              }} />
+            ))}
+          </div>
+
+          {/* Hours per week */}
+          <label style={lbl}>ЧАСОВ В НЕДЕЛЮ</label>
+          <input type="number" min="1" max="80" step="0.5" style={inp}
+            value={form.weeklyHours} onChange={e => set("weeklyHours", e.target.value)} />
+
+          {/* Task type */}
+          <label style={lbl}>ТИП РАБОТЫ</label>
+          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+            {[["heavy","Требует компьютер 💻"],["light","Можно читать/думать 📖"]].map(([v,label]) => (
+              <label key={v} style={{ display:"flex", alignItems:"center", gap:8, cursor:"pointer", fontSize:12,
+                color: form.taskType === v ? "var(--text-primary)" : "var(--text-secondary)" }}>
+                <input type="radio" name="taskType" value={v} checked={form.taskType === v}
+                  onChange={() => set("taskType", v)} style={{ accentColor:"#818CF8" }} />
+                {label}
+              </label>
+            ))}
+          </div>
+
+          {/* Deadline */}
+          <label style={lbl}>ДЕДЛАЙН</label>
+          <label style={{ display:"flex", alignItems:"center", gap:8, fontSize:12,
+            color:"var(--text-secondary)", cursor:"pointer", marginBottom:6 }}>
+            <input type="checkbox" checked={form.noDeadline}
+              onChange={e => set("noDeadline", e.target.checked)}
+              style={{ accentColor:"#818CF8" }} />
+            Бессрочный проект
+          </label>
+          {!form.noDeadline && (
+            <input type="date" style={inp} value={form.deadline}
+              onChange={e => set("deadline", e.target.value)} />
+          )}
+
+          {/* Start date */}
+          <label style={lbl}>ДАТА НАЧАЛА</label>
+          <input type="date" style={inp} value={form.startDate}
+            onChange={e => set("startDate", e.target.value)} />
+
+          {/* Live preview */}
+          <div style={{ marginTop:14, padding:"10px 12px", background:"rgba(129,140,248,0.07)",
+            borderRadius:6, border:"1px solid rgba(129,140,248,0.15)", fontSize:11, color:"#818CF8" }}>
+            ~{hoursDay} ч/день
+            {weeksLeft ? ` · до дедлайна ~${weeksLeft} нед.` : " · бессрочно"}
+            {totalH   ? ` · всего ~${totalH} ч` : ""}
+          </div>
+
+          {lowTime && (
+            <div style={{ marginTop:8, padding:"8px 12px", background:"rgba(253,211,70,0.08)",
+              borderRadius:6, border:"1px solid rgba(253,211,70,0.25)", fontSize:11, color:"#FCD34D" }}>
+              ⚠️ Мало времени — рассмотри увеличение часов/нед
+            </div>
+          )}
+
+          <div style={{ display:"flex", gap:8, marginTop:20, justifyContent:"flex-end" }}>
+            <button type="button" onClick={onClose}
+              style={{ padding:"7px 16px", borderRadius:6, border:"1px solid var(--border)",
+                background:"transparent", color:"var(--text-secondary)", fontSize:11,
+                cursor:"pointer", fontFamily:"inherit" }}>
+              Отмена
+            </button>
+            <button type="submit"
+              style={{ padding:"7px 16px", borderRadius:6, border:"none",
+                background:`linear-gradient(90deg,${form.color},#818CF8)`,
+                color:"var(--bg-base)", fontSize:11, fontWeight:700,
+                cursor:"pointer", fontFamily:"inherit" }}>
+              Создать проект
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+});
 
 // ═══════════════════════════════════════════
 //  BULK SCHEDULE MODAL
 // ═══════════════════════════════════════════
-function BulkScheduleModal({ isOpen, onClose, onConfirm, items }) {
+const BulkScheduleModal = React.memo(function BulkScheduleModal({ isOpen, onClose, onConfirm, items }) {
   const [activeIdx, setActiveIdx] = useState(0);
   const [editedItems, setEditedItems] = useState([]);
 
@@ -1447,7 +2104,129 @@ function BulkScheduleModal({ isOpen, onClose, onConfirm, items }) {
       </div>
     </div>
   );
-}
+});
+
+// ═══════════════════════════════════════════
+//  DAY TIMELINE COMPONENT
+// ═══════════════════════════════════════════
+const BLOCK_ICONS = {
+  wake:      "🌅",
+  sport:     "🏃",
+  home_work: "🏠",
+  commute:   "🚌",
+  class:     "🎓",
+  break:     "☕",
+  free:      "✨",
+};
+
+const BLOCK_DEFAULT_COLOR = {
+  wake:      "#818CF8",
+  sport:     "#4ADE80",
+  home_work: "#22D3EE",
+  commute:   "#FFD93D",
+  class:     "#C084FC",
+  break:     "#6B7280",
+  free:      "#F9A8D4",
+};
+
+/** Parse "HH:MM" → minutes */
+const _tlParse = (s) => { const [h, m] = s.split(":").map(Number); return h * 60 + (m || 0); };
+
+/** Height in px: 1h = 60px, min 40px */
+const _blockH = (start, end) => Math.max(40, (_tlParse(end) - _tlParse(start)));
+
+export const DayTimeline = React.memo(function DayTimeline({ blocks = [], theme = "dark", onBlockClick }) {
+  if (!blocks.length) return null;
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", position:"relative", paddingLeft:52 }}>
+
+      {/* Vertical time rail */}
+      <div style={{
+        position:"absolute", left:44, top:8, bottom:8,
+        width:2, background:"var(--border)", borderRadius:1,
+      }} />
+
+      {blocks.map((block, i) => {
+        const h         = _blockH(block.startTime, block.endTime);
+        const color     = block.color ?? BLOCK_DEFAULT_COLOR[block.type] ?? "#818CF8";
+        const dimmed    = block.opacity != null && block.opacity < 1;
+        const textCol   = dimmed ? "var(--text-muted)" : "var(--text-primary)";
+        const icon      = BLOCK_ICONS[block.type] ?? "•";
+        const clickable = block.type === "home_work" && !!block.taskId && !!onBlockClick;
+
+        return (
+          <div key={i}
+            style={{ display:"flex", alignItems:"flex-start", minHeight:h, position:"relative",
+              cursor: clickable ? "pointer" : "default",
+              borderRadius:6,
+            }}
+            onClick={clickable ? () => onBlockClick(block) : undefined}>
+
+            {/* Time label */}
+            <div style={{
+              position:"absolute", left:-52, top:0,
+              width:40, textAlign:"right",
+              fontSize:10, color:"var(--text-faint)", lineHeight:"20px",
+              flexShrink:0, userSelect:"none",
+            }}>
+              {block.startTime}
+            </div>
+
+            {/* Dot on rail */}
+            <div style={{
+              position:"absolute", left:-10, top:6,
+              width:8, height:8, borderRadius:"50%",
+              background: color,
+              border:`2px solid ${theme === "light" ? "#fff" : "#07070F"}`,
+              zIndex:1,
+            }} />
+
+            {/* Block content */}
+            <div style={{
+              flex:1, marginLeft:12, marginBottom:4,
+              display:"flex", alignItems:"stretch",
+              opacity: block.opacity ?? 1,
+              minHeight:h - 4,
+            }}>
+              {/* Color strip */}
+              <div style={{
+                width:3, borderRadius:2, flexShrink:0,
+                background: color, marginRight:10, alignSelf:"stretch",
+              }} />
+
+              {/* Text */}
+              <div style={{ flex:1, paddingTop:2 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                  <span style={{ fontSize:14, lineHeight:1 }}>{icon}</span>
+                  <span style={{ fontSize:13, color: textCol, lineHeight:1.3 }}>{block.label}</span>
+                  {block.isLight && (
+                    <span style={{
+                      fontSize:9, color:"var(--text-faint)",
+                      marginLeft:"auto", flexShrink:0, paddingRight:4,
+                    }}>
+                      можно читать 📖
+                    </span>
+                  )}
+                </div>
+                {block.sublabel && (
+                  <div style={{
+                    fontSize:11, color:"var(--text-faint)",
+                    fontStyle:"italic", marginTop:3, paddingLeft:20,
+                    lineHeight:1.4,
+                  }}>
+                    {block.sublabel}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
 
 // ═══════════════════════════════════════════
 //  COMPONENT
@@ -1459,20 +2238,50 @@ export default function StudyDashboard() {
   const [tab, setTab] = useState("days"); // "days" | "all"
   const [modalOpen, setModalOpen] = useState(false);
   const [bookModalOpen, setBookModalOpen] = useState(false);
+  const [projectModalOpen, setProjectModalOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkItems, setBulkItems] = useState([]);
   const [toast, setToast] = useState("");
   const [schedule, setSchedule] = useState({});           // { taskId: [{date, assignedHours}] }
   const [completedSessions, setCompletedSessions] = useState(new Set()); // "taskId::date"
-  const { userTasks, addUserTask, removeUserTask } = useUserTasks();
-  const { userBooks, addUserBook, removeUserBook } = useUserBooks();
+  const { userId, syncedGet, syncedSet, syncFromShared } = useSyncedStorage();
+  const { userTasks, addUserTask, removeUserTask } = useUserTasks({ syncedGet, syncedSet });
+  const { userBooks, addUserBook, removeUserBook } = useUserBooks({ syncedGet, syncedSet });
   const { theme, toggleTheme } = useTheme();
+  const { settings, updateSettings } = useUserSettings({ syncedGet, syncedSet });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsRef = useRef(null);
+  const { projects, activeProjects, addProject, completeProject, updateProject, deleteProject } = useProjects({ syncedGet, syncedSet });
+  const { recurringWork, getWeekAllocation, setWeekOverride } = useRecurringWork(userTasks, activeProjects);
+  const [completedWorkBlocks, setCompletedWorkBlocks] = useState(new Set());
+  const [workEdit, setWorkEdit] = useState(null); // { workId, date, value }
+  const [dayViews, setDayViews] = useState({}); // { [date]: "timeline" | "tasks" }
+  const [highlightTask, setHighlightTask] = useState(null); // { id, date }
+  const [doneProjectsOpen, setDoneProjectsOpen] = useState(false);
+  const [currentMonth, setCurrentMonth] = useState(() => {
+    try { return window.storage?.getItem?.("current_month_v1") || "2026-03"; } catch { return "2026-03"; }
+  });
+  const [calendarView, setCalendarView] = useState(() => {
+    try { return window.storage?.getItem?.("calendar_view_v1") || "month"; } catch { return "month"; }
+  });
+  const [currentWeekStart, setCurrentWeekStart] = useState(() => {
+    const today = new Date();
+    const dow = today.getDay();
+    const d = new Date(today);
+    d.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1));
+    return d.toISOString().split("T")[0];
+  });
+  const analyticsData = useAnalytics(activeProjects);
   const {
     xp, streak, level, nextLevel, xpToNext, progressPct: xpPct,
     unlockedAchievements, lastUnlocked,
     addXP, checkAndUpdateStreak, markDayComplete,
     unlockAchievement, checkAchievements,
-  } = useGameState();
+  } = useGameState({ syncedGet, syncedSet });
+  const [syncInput, setSyncInput] = useState("");
+  const [syncStatus, setSyncStatus] = useState(null); // { ok: bool, msg: string } | null
+  const [lastSyncTime, setLastSyncTime] = useState(null);
+  const hasPendingWrites = useStoragePending();
   const [achievementPopup, setAchievementPopup] = useState(null);
   const prevCompletedRef = useRef(null);
   const prevUserBooksRef = useRef(null);
@@ -1486,6 +2295,8 @@ export default function StudyDashboard() {
         if (sc) setSchedule(JSON.parse(sc));
         const ss = localStorage.getItem("user_sessions_v1");
         if (ss) setCompletedSessions(new Set(JSON.parse(ss)));
+        const wb = window.storage?.getItem?.("work_sessions_done_v1");
+        if (wb) setCompletedWorkBlocks(new Set(JSON.parse(wb)));
       } catch {}
       setLoaded(true);
     })();
@@ -1548,7 +2359,7 @@ export default function StudyDashboard() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem("sp4_done_v3", JSON.stringify([...completed])); } catch {}
+    debouncedWrite("sp4_done_v3", [...completed], v => localStorage.setItem("sp4_done_v3", JSON.stringify(v)), 800);
   }, [completed, loaded]);
 
   useEffect(() => {
@@ -1556,13 +2367,37 @@ export default function StudyDashboard() {
     try { localStorage.setItem("user_sessions_v1", JSON.stringify([...completedSessions])); } catch {}
   }, [completedSessions, loaded]);
 
+  useEffect(() => {
+    if (!loaded) return;
+    debouncedWrite("work_sessions_done_v1", [...completedWorkBlocks], v => window.storage?.setItem?.("work_sessions_done_v1", JSON.stringify(v)), 800);
+    // Check week_warrior: if done hours this week >= weeklyHours for any recurring work
+    const todayDate = new Date().toISOString().split("T")[0];
+    const ws = (() => {
+      const d = new Date(todayDate + "T00:00:00");
+      const dow = d.getDay();
+      d.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
+      return d.toISOString().split("T")[0];
+    })();
+    const weekDates = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(ws + "T00:00:00");
+      d.setDate(d.getDate() + i);
+      return d.toISOString().split("T")[0];
+    });
+    for (const work of recurringWork) {
+      const dateMap = allWeekAllocations[ws]?.[work.id] || {};
+      const doneH = weekDates.reduce((sum, d) =>
+        completedWorkBlocks.has(`${work.id}_${d}`) ? sum + (dateMap[d] || 0) : sum, 0);
+      if (doneH >= work.weeklyHours) unlockAchievement("week_warrior");
+    }
+  }, [completedWorkBlocks, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const [xpPopups, setXpPopups] = useState([]);
 
   const spawnXpPopup = useCallback((amount, rect, bonus) => {
     const popup = { id: Date.now() + Math.random(), amount, bonus,
       x: rect.left + rect.width / 2, y: rect.top };
     setXpPopups(p => [...p, popup]);
-    setTimeout(() => setXpPopups(p => p.filter(pp => pp.id !== popup.id)), 1000);
+    requestAnimationFrame(() => setTimeout(() => setXpPopups(p => p.filter(pp => pp.id !== popup.id)), 900));
   }, []);
 
   const toggle = useCallback(id => {
@@ -1637,12 +2472,90 @@ export default function StudyDashboard() {
     try { localStorage.setItem("user_schedule_v1", JSON.stringify(newSchedule)); } catch {}
   }, [schedule]);
 
+  const toggleWorkBlock = useCallback((workId, date) => {
+    setCompletedWorkBlocks(p => {
+      const key = `${workId}_${date}`;
+      const n = new Set(p);
+      n.has(key) ? n.delete(key) : n.add(key);
+      return n;
+    });
+  }, []);
+
+  const handleWorkBlockToggle = useCallback((e, work, date, hours) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const blockKey = `${work.id}_${date}`;
+    const wasCompleted = completedWorkBlocks.has(blockKey);
+    if (!wasCompleted) {
+      const xpAmount = Math.round(hours * 8);
+      addXP(xpAmount);
+      spawnXpPopup(xpAmount, rect, false);
+    }
+    toggleWorkBlock(work.id, date);
+  }, [completedWorkBlocks, addXP, spawnXpPopup, toggleWorkBlock]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Week helpers
+  const getWeekStartDate = (dateStr) => {
+    const d = new Date(dateStr + "T00:00:00");
+    const dow = d.getDay();
+    d.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
+    return d.toISOString().split("T")[0];
+  };
+
+  const getWeekKeyStr = (dateStr) => {
+    const ws = getWeekStartDate(dateStr);
+    const d = new Date(ws + "T00:00:00");
+    const thu = new Date(d);
+    thu.setDate(d.getDate() + 3);
+    const jan4 = new Date(thu.getFullYear(), 0, 4);
+    const wn = 1 + Math.round((thu - jan4) / 604800000);
+    return `${thu.getFullYear()}-W${String(wn).padStart(2, "0")}`;
+  };
+
+  // Pre-compute week allocations for all unique weeks in DAYS
+  const allWeekAllocations = useMemo(() => {
+    const result = {};
+    const seen = new Set();
+    for (const day of DAYS) {
+      const ws = getWeekStartDate(day.date);
+      if (!seen.has(ws)) {
+        seen.add(ws);
+        result[ws] = getWeekAllocation(ws);
+      }
+    }
+    return result;
+  }, [getWeekAllocation]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const getWorkHoursForDay = (dateStr) => {
+    const ws    = getWeekStartDate(dateStr);
+    const alloc = allWeekAllocations[ws] || {};
+    const result = {};
+    for (const [projId, dateMap] of Object.entries(alloc)) {
+      result[projId] = dateMap[dateStr] ?? 0;
+    }
+    return result;
+  };
+
+  // Close settings dropdown on outside click
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const handler = (e) => {
+      if (settingsRef.current && !settingsRef.current.contains(e.target)) {
+        setSettingsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [settingsOpen]);
+
   // Stats
-  const totalTasks = TASKS.length;
-  const doneCount  = TASKS.filter(t => completed.has(t.id)).length;
-  const totalH     = TASKS.reduce((s, t) => s + t.est, 0);
-  const doneH      = TASKS.filter(t => completed.has(t.id)).reduce((s, t) => s + t.est, 0);
-  const pct        = Math.round(doneCount / totalTasks * 100);
+  const { totalTasks, doneCount, totalH, doneH, pct } = useMemo(() => {
+    const totalTasks = TASKS.length;
+    const doneCount  = TASKS.filter(t => completed.has(t.id)).length;
+    const totalH     = TASKS.reduce((s, t) => s + t.est, 0);
+    const doneH      = TASKS.filter(t => completed.has(t.id)).reduce((s, t) => s + t.est, 0);
+    const pct        = Math.round(doneCount / totalTasks * 100);
+    return { totalTasks, doneCount, totalH, doneH, pct };
+  }, [completed]);
 
   const [todayStr, setTodayStr] = useState(() => new Date().toISOString().split("T")[0]);
   useEffect(() => {
@@ -1660,10 +2573,10 @@ export default function StudyDashboard() {
   const daysToSemester = daysUntil("2026-05-31");
   const daysToSprint   = daysUntil("2026-03-15");
 
-  const catStats = Object.keys(CAT).map(c => {
+  const catStats = useMemo(() => Object.keys(CAT).map(c => {
     const ts = TASKS.filter(t => t.cat === c);
     return { c, total: ts.length, done: ts.filter(t => completed.has(t.id)).length };
-  });
+  }), [completed]);
 
   if (!loaded) return (
     <div style={{ minHeight:"100vh", background:"var(--bg-base)", display:"flex", alignItems:"center", justifyContent:"center", color:"var(--text-secondary)", fontFamily:"monospace", fontSize:12, letterSpacing:3 }}>
@@ -1683,11 +2596,13 @@ export default function StudyDashboard() {
           --shadow-card:none;--shadow-elevated:none;
         }
         [data-theme="light"]{
-          --bg-base:#FAFAF7;--bg-surface:#F4F4EF;--bg-elevated:#FFFFFF;--bg-card:#FFFFFF;
-          --border:#E8E8E0;--border-subtle:#EFEFEA;
-          --text-primary:#1A1A2E;--text-secondary:var(--text-secondary);--text-muted:var(--text-muted);--text-faint:#ABABBB;--text-ghost:#C8C8D8;
-          --shadow-card:0 1px 3px rgba(0,0,0,0.08),0 1px 2px rgba(0,0,0,0.04);--shadow-elevated:0 4px 12px rgba(0,0,0,0.1);
-          --cbx-bg-empty:#F0F0EA;
+          --bg-base:#F7F4FB;--bg-surface:#F0ECF8;--bg-elevated:#FFFFFF;--bg-card:#FFFFFF;
+          --border:#DDD6EE;--border-subtle:#EAE6F4;
+          --text-primary:#2A2040;--text-secondary:#5A4E7A;--text-muted:#8A7EAA;--text-faint:#B0A6C8;--text-ghost:#CEC8E0;
+          --shadow-card:0 1px 4px rgba(100,80,160,0.08),0 1px 2px rgba(100,80,160,0.04);
+          --shadow-elevated:0 4px 16px rgba(100,80,160,0.12);
+          --cbx-bg-empty:#EDE8F6;
+          --accent-lavender:#B8A8D8;--accent-pink:#E8B4C0;--accent-blue:#A8C8E8;--accent-mint:#A8D8CC;--accent-peach:#F0C4B0;
         }
         *{box-sizing:border-box;margin:0;padding:0}
         *:not(.pf):not(.cbx){transition:background-color 0.3s ease,color 0.3s ease,border-color 0.3s ease,box-shadow 0.3s ease}
@@ -1701,14 +2616,14 @@ export default function StudyDashboard() {
         @keyframes slideOut{from{opacity:1;transform:translateX(0)}to{opacity:0;transform:translateX(100px)}}
         @keyframes shrink{from{width:100%}to{width:0%}}
         @keyframes floatUp{0%{opacity:1;transform:translateY(0) scale(1)}50%{opacity:1;transform:translateY(-20px) scale(1.1)}100%{opacity:0;transform:translateY(-45px) scale(0.9)}}
-        @media(max-width:599px){.xp-num{display:none!important}}
+        @media(max-width:599px){.xp-num{display:none!important}.week-scroll{flex-direction:column!important;overflow-x:visible!important}}
         .cbx{width:15px;height:15px;border-radius:3px;border:1.5px solid var(--border);background:var(--cbx-bg-empty,transparent);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:all .15s}
         .cbx:hover{border-color:#5A5A8A}
         .cbx.on{border-color:transparent}
       `}</style>
 
       {/* ── HEADER ── */}
-      <div style={{ background:"var(--bg-surface)", borderBottom:"1px solid var(--border)", padding:"18px 20px 14px" }}>
+      <div style={{ background:"var(--bg-elevated)", borderBottom:"1px solid var(--border)", padding:"18px 20px 14px" }}>
         <div style={{ maxWidth:1100, margin:"0 auto" }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
             <div>
@@ -1738,9 +2653,9 @@ export default function StudyDashboard() {
                       <div title={`${xpToNext} XP до следующего уровня`}
                         style={{ width:120, height:6, background:"var(--border)", borderRadius:3, overflow:"hidden" }}>
                         <div className="xpf" style={{ height:"100%", width:`${xpPct}%`,
-                          background:`linear-gradient(90deg,${fromColor},${toColor})`, borderRadius:3 }} />
+                          background: theme==="light" ? "linear-gradient(90deg,#B8A8D8,#A8C8E8)" : `linear-gradient(90deg,${fromColor},${toColor})`, borderRadius:3 }} />
                       </div>
-                      <span className="xp-num" style={{ fontSize:11, color:"var(--text-muted)", lineHeight:1 }}>{xp} XP</span>
+                      <span className="xp-num" style={{ fontSize:11, color: theme==="light" ? "var(--text-secondary)" : "var(--text-muted)", lineHeight:1 }}>{xp} XP</span>
                       {streak > 0 && (
                         <span style={{ fontSize:11, color: streak >= 7 ? "#FF6B6B" : "#FFD93D", lineHeight:1 }}>
                           🔥 {streak}
@@ -1772,12 +2687,180 @@ export default function StudyDashboard() {
                     cursor:"pointer", fontFamily:"inherit", letterSpacing:0.5 }}>
                   ＋ Книга
                 </button>
+                <button onClick={() => setProjectModalOpen(true)}
+                  style={{ padding:"6px 14px", borderRadius:6, border:"1px solid #2A1A4E",
+                    background:"rgba(192,132,252,0.1)", color:"#C084FC", fontSize:11,
+                    cursor:"pointer", fontFamily:"inherit", letterSpacing:0.5 }}>
+                  ＋ Проект
+                </button>
                 <button onClick={toggleTheme}
                   style={{ width:32, height:32, borderRadius:"50%", border:"1px solid var(--border)",
                     background:"var(--bg-elevated)", fontSize:16, cursor:"pointer",
                     display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
                   {theme === "dark" ? "🌙" : "☀️"}
                 </button>
+
+                {/* ⚙️ Settings */}
+                <div ref={settingsRef} style={{ position:"relative" }}>
+                  <button onClick={() => setSettingsOpen(o => !o)}
+                    style={{ width:32, height:32, borderRadius:"50%", border:"1px solid var(--border)",
+                      background: settingsOpen ? "var(--bg-surface)" : "var(--bg-elevated)",
+                      fontSize:16, cursor:"pointer", position:"relative",
+                      display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                    ⚙️
+                    {hasPendingWrites && (
+                      <span style={{
+                        position:"absolute", top:4, right:4,
+                        width:6, height:6, borderRadius:"50%",
+                        background:"#94A3B8", pointerEvents:"none",
+                      }} />
+                    )}
+                  </button>
+
+                  {settingsOpen && (
+                    <div style={{
+                      position:"absolute", top:38, right:0, zIndex:200,
+                      background:"var(--bg-elevated)", border:"1px solid var(--border)",
+                      borderRadius:10, padding:"14px 16px", width:240,
+                      boxShadow:"var(--shadow-elevated)", display:"flex", flexDirection:"column", gap:12,
+                    }}>
+                      <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:2 }}>НАСТРОЙКИ ДНЯ</div>
+
+                      {/* Wake time */}
+                      <label style={{ display:"flex", justifyContent:"space-between", alignItems:"center", fontSize:11, color:"var(--text-secondary)" }}>
+                        Подъём в:
+                        <select value={settings.wakeUpTime * 60}
+                          onChange={e => updateSettings({ wakeUpTime: Number(e.target.value) / 60 })}
+                          style={{ background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:5,
+                            color:"var(--text-primary)", fontSize:11, padding:"2px 6px", cursor:"pointer" }}>
+                          {Array.from({ length: 11 }, (_, i) => 5 * 60 + i * 30).map(min => (
+                            <option key={min} value={min}>
+                              {String(Math.floor(min / 60)).padStart(2,"0")}:{String(min % 60).padStart(2,"0")}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      {/* Sport days */}
+                      <div>
+                        <div style={{ fontSize:11, color:"var(--text-secondary)", marginBottom:6 }}>Спорт:</div>
+                        <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+                          {[["Пн",1],["Вт",2],["Ср",3],["Чт",4],["Пт",5],["Сб",6],["Вс",0]].map(([label, dow]) => {
+                            const on = settings.hasSportDays.includes(dow);
+                            return (
+                              <button key={dow}
+                                onClick={() => updateSettings({
+                                  hasSportDays: on
+                                    ? settings.hasSportDays.filter(d => d !== dow)
+                                    : [...settings.hasSportDays, dow],
+                                })}
+                                style={{
+                                  padding:"3px 7px", borderRadius:5, fontSize:10, cursor:"pointer",
+                                  border:`1px solid ${on ? "#4ADE80" : "var(--border)"}`,
+                                  background: on ? "rgba(74,222,128,0.12)" : "transparent",
+                                  color: on ? "#4ADE80" : "var(--text-muted)",
+                                  fontFamily:"inherit",
+                                }}>
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Sport duration */}
+                      <label style={{ display:"flex", justifyContent:"space-between", alignItems:"center", fontSize:11, color:"var(--text-secondary)" }}>
+                        Длительность спорта:
+                        <select value={settings.sportDuration}
+                          onChange={e => updateSettings({ sportDuration: Number(e.target.value) })}
+                          style={{ background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:5,
+                            color:"var(--text-primary)", fontSize:11, padding:"2px 6px", cursor:"pointer" }}>
+                          <option value={1}>1ч</option>
+                          <option value={1.5}>1.5ч</option>
+                          <option value={2}>2ч</option>
+                        </select>
+                      </label>
+
+                      {/* ── Sync section ── */}
+                      <div style={{ borderTop:"1px solid var(--border)", paddingTop:10, marginTop:2 }}>
+                        <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:8 }}>СИНХРОНИЗАЦИЯ</div>
+
+                        {/* Device ID */}
+                        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10 }}>
+                          <span style={{ fontSize:10, color:"var(--text-muted)", flexShrink:0 }}>Твой ID:</span>
+                          <span style={{ fontSize:10, color:"var(--text-primary)", fontFamily:"monospace", flex:1,
+                            overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                            {userId.slice(0, 8)}
+                          </span>
+                          <button
+                            onClick={() => { try { navigator.clipboard.writeText(userId); } catch {} }}
+                            title="Скопировать ID"
+                            style={{ fontSize:13, background:"none", border:"none", cursor:"pointer", padding:"0 2px", flexShrink:0 }}>
+                            📋
+                          </button>
+                        </div>
+
+                        {/* Refresh from own cloud */}
+                        <button
+                          onClick={() => {
+                            const r = syncFromShared(userId);
+                            setLastSyncTime(new Date().toLocaleTimeString("ru-RU", { hour:"2-digit", minute:"2-digit" }));
+                            setSyncStatus({ ok: r.keysRestored > 0, msg: r.keysRestored > 0
+                              ? `✅ Обновлено (${r.keysRestored} кл.)` : "❌ Данные не найдены" });
+                            setTimeout(() => setSyncStatus(null), 4000);
+                          }}
+                          style={{ width:"100%", padding:"5px 8px", borderRadius:5, border:"1px solid var(--border)",
+                            background:"rgba(129,140,248,0.08)", color:"#818CF8", fontSize:10,
+                            cursor:"pointer", fontFamily:"inherit", marginBottom:8, textAlign:"left" }}>
+                          🔄 Обновить с облака
+                          {lastSyncTime && <span style={{ float:"right", color:"var(--text-faint)", fontSize:9 }}>{lastSyncTime}</span>}
+                        </button>
+
+                        {/* Restore from another device */}
+                        <div style={{ fontSize:9, color:"var(--text-faint)", marginBottom:4 }}>
+                          Перенести с другого устройства:
+                        </div>
+                        <div style={{ display:"flex", gap:5 }}>
+                          <input
+                            value={syncInput}
+                            onChange={e => setSyncInput(e.target.value)}
+                            placeholder="u_abc123…"
+                            style={{ flex:1, padding:"4px 7px", borderRadius:5, border:"1px solid var(--border)",
+                              background:"var(--bg-surface)", color:"var(--text-primary)", fontSize:10,
+                              fontFamily:"monospace", outline:"none", minWidth:0 }}
+                          />
+                          <button
+                            onClick={() => {
+                              const id = syncInput.trim();
+                              if (!id) return;
+                              const r = syncFromShared(id);
+                              setSyncStatus({ ok: r.keysRestored > 0, msg: r.keysRestored > 0
+                                ? `✅ Данные восстановлены (${r.keysRestored} ключей)` : "❌ Данные не найдены для этого ID" });
+                              if (r.keysRestored > 0) setSyncInput("");
+                              setTimeout(() => setSyncStatus(null), 4000);
+                            }}
+                            style={{ padding:"4px 8px", borderRadius:5, border:"1px solid var(--border)",
+                              background:"rgba(34,211,238,0.08)", color:"#22D3EE", fontSize:10,
+                              cursor:"pointer", fontFamily:"inherit", flexShrink:0, whiteSpace:"nowrap" }}>
+                            Синхр.
+                          </button>
+                        </div>
+
+                        {syncStatus && (
+                          <div style={{ marginTop:6, fontSize:10,
+                            color: syncStatus.ok ? "#4ADE80" : "#FF6B6B" }}>
+                            {syncStatus.msg}
+                          </div>
+                        )}
+
+                        <div style={{ marginTop:8, fontSize:9, color:"var(--text-ghost)", lineHeight:1.5 }}>
+                          Синхронизация через общее хранилище.<br />
+                          Не передавай свой ID посторонним.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <div style={{ fontFamily:"'IBM Plex Sans'", fontWeight:700, fontSize:32,
                   color: pct>75?"#4ADE80":pct>40?"#FFD93D":"#818CF8" }}>
                   {pct}%
@@ -1785,14 +2868,14 @@ export default function StudyDashboard() {
               </div>
               <div style={{ width:180, height:5, background:"var(--border)", borderRadius:3, overflow:"hidden" }}>
                 <div className="pf" style={{ height:"100%", width:`${pct}%`,
-                  background:"linear-gradient(90deg,#818CF8,#22D3EE)", borderRadius:3 }} />
+                  background: theme==="light" ? "linear-gradient(90deg,#B8A8D8,#A8C8E8)" : "linear-gradient(90deg,#818CF8,#22D3EE)", borderRadius:3 }} />
               </div>
             </div>
           </div>
 
           {/* Tabs */}
           <div style={{ display:"flex", gap:4, marginTop:14 }}>
-            {[["days","📅 По дням"],["all","📋 Все задачи"],["achievements","🏆 Достижения"]].map(([id,label]) => (
+            {[["days","📅 По дням"],["all","📋 Все задачи"],["achievements","🏆 Достижения"],["analytics","📊 Аналитика"]].map(([id,label]) => (
               <button key={id} onClick={() => setTab(id)}
                 style={{ padding:"5px 14px", borderRadius:6, border:"1px solid var(--border)", cursor:"pointer", fontSize:11,
                   background: tab===id ? "#181838" : "transparent",
@@ -1832,6 +2915,177 @@ export default function StudyDashboard() {
             )}
           </div>
 
+          {/* НЕДЕЛЯ */}
+          {recurringWork.length > 0 && (() => {
+            const currentWS = getWeekStartDate(todayStr);
+            const currentAlloc = allWeekAllocations[currentWS] || {};
+            const weekDates = Array.from({ length: 7 }, (_, i) => {
+              const d = new Date(currentWS + "T00:00:00");
+              d.setDate(d.getDate() + i);
+              return d.toISOString().split("T")[0];
+            });
+            return (
+              <div style={{ marginBottom:14, padding:"10px 12px", background:"var(--bg-elevated)", borderRadius:8, border:"1px solid var(--border)" }}>
+                <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:8 }}>НЕДЕЛЯ</div>
+                {recurringWork.map(work => {
+                  const dateMap = currentAlloc[work.id] || {};
+                  const doneH = weekDates.reduce((sum, dateStr) =>
+                    completedWorkBlocks.has(`${work.id}_${dateStr}`) ? sum + (dateMap[dateStr] || 0) : sum, 0);
+                  const pct = work.weeklyHours > 0 ? Math.min(100, Math.round(doneH / work.weeklyHours * 100)) : 0;
+                  return (
+                    <div key={work.id}>
+                      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4, alignItems:"center" }}>
+                        <span style={{ fontSize:10, color:"var(--text-secondary)" }}>{work.emoji} {work.title}</span>
+                        <span style={{ fontSize:9, color:"var(--text-muted)" }}>{Math.round(doneH * 10) / 10} / {work.weeklyHours}ч</span>
+                      </div>
+                      <div style={{ height:2.5, background:"var(--border)", borderRadius:2, overflow:"hidden" }}>
+                        <div className="pf" style={{ height:"100%", width:`${pct}%`, background:work.color, borderRadius:2 }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+
+          {/* МОИ ПРОЕКТЫ */}
+          {projects.length > 0 && (() => {
+            // Compute total spent hours per project across all completed work blocks
+            const spentByProject = {};
+            for (const proj of projects) {
+              let h = 0;
+              for (const alloc of Object.values(allWeekAllocations)) {
+                const dateMap = alloc[proj.id] || {};
+                for (const [dateStr, hours] of Object.entries(dateMap)) {
+                  if (completedWorkBlocks.has(`${proj.id}_${dateStr}`)) h += hours;
+                }
+              }
+              spentByProject[proj.id] = Math.round(h * 10) / 10;
+            }
+
+            const doneProjects = projects.filter(p => p.status === "done");
+
+            const handleComplete = (proj) => {
+              const msg = `Завершить проект «${proj.title}»? Он будет отмечен как выполненный.`;
+              if (!window.confirm(msg)) return;
+              completeProject(proj.id);
+              const spent = spentByProject[proj.id] ?? 0;
+              const earnedXP = Math.round(spent * 5);
+              if (earnedXP > 0) addXP(earnedXP);
+              setAchievementPopup({ emoji: "🎉", label: "Проект завершён!", desc: `${proj.emoji} ${proj.title} · +${earnedXP} XP` });
+              setTimeout(() => setAchievementPopup(null), 4000);
+            };
+
+            return (
+              <div style={{ marginBottom:14, padding:"10px 12px", background:"var(--bg-elevated)", borderRadius:8, border:"1px solid var(--border)" }}>
+                <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:8 }}>МОИ ПРОЕКТЫ</div>
+
+                {/* Active projects */}
+                {activeProjects.map(proj => {
+                  const spent   = spentByProject[proj.id] ?? 0;
+                  const goal    = proj.totalHoursGoal;
+                  const pct     = goal ? Math.min(100, Math.round(spent / goal * 100)) : null;
+
+                  // Current week hours
+                  const currentWS = getWeekStartDate(todayStr);
+                  const weekDateMap = (allWeekAllocations[currentWS] || {})[proj.id] || {};
+                  const weekDatesArr = Array.from({ length: 7 }, (_, i) => {
+                    const d = new Date(currentWS + "T00:00:00");
+                    d.setDate(d.getDate() + i);
+                    return d.toISOString().split("T")[0];
+                  });
+                  const weekDoneH = weekDatesArr.reduce((sum, ds) =>
+                    completedWorkBlocks.has(`${proj.id}_${ds}`) ? sum + (weekDateMap[ds] || 0) : sum, 0);
+
+                  // Deadline info
+                  let deadlineLabel = null;
+                  if (proj.deadline) {
+                    const weeksLeft = Math.ceil(
+                      (new Date(proj.deadline) - new Date()) / (7 * 24 * 3600 * 1000)
+                    );
+                    const dlStr = new Date(proj.deadline + "T00:00:00")
+                      .toLocaleDateString("ru-RU", { day:"numeric", month:"short" });
+                    deadlineLabel = `до ${dlStr} · ${Math.max(0, weeksLeft)} нед`;
+                  }
+
+                  return (
+                    <div key={proj.id} style={{ marginBottom:10 }}>
+                      {/* Title row */}
+                      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:3 }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:5, minWidth:0 }}>
+                          <span style={{ width:7, height:7, borderRadius:"50%", background:proj.color, flexShrink:0, display:"inline-block" }} />
+                          <span style={{ fontSize:11, color:"var(--text-primary)", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                            {proj.emoji} {proj.title}
+                          </span>
+                        </div>
+                        <button onClick={() => handleComplete(proj)}
+                          style={{ fontSize:9, padding:"2px 7px", borderRadius:4, border:"1px solid var(--border)",
+                            background:"transparent", color:"var(--text-muted)", cursor:"pointer",
+                            fontFamily:"inherit", flexShrink:0, marginLeft:4, whiteSpace:"nowrap" }}>
+                          ✓ Завершить
+                        </button>
+                      </div>
+
+                      {/* Progress bar */}
+                      {goal ? (
+                        <>
+                          <div style={{ height:3, background:"var(--border)", borderRadius:2, overflow:"hidden", marginBottom:2 }}>
+                            <div style={{ height:"100%", width:`${pct}%`, background:proj.color, borderRadius:2, transition:"width .3s" }} />
+                          </div>
+                          <div style={{ fontSize:9, color:"var(--text-faint)", display:"flex", justifyContent:"space-between" }}>
+                            <span>{spent} / {goal} ч ({pct}%)</span>
+                            {deadlineLabel && <span>{deadlineLabel}</span>}
+                          </div>
+                        </>
+                      ) : (
+                        <div style={{ fontSize:9, color:"var(--text-faint)" }}>
+                          {Math.round(weekDoneH * 10) / 10} ч эта неделя / {proj.weeklyHours} ч цель
+                          {deadlineLabel && <span style={{ marginLeft:6 }}>{deadlineLabel}</span>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* Completed projects toggle */}
+                {doneProjects.length > 0 && (
+                  <div style={{ marginTop:4 }}>
+                    <button onClick={() => setDoneProjectsOpen(o => !o)}
+                      style={{ fontSize:9, color:"var(--text-faint)", background:"none", border:"none",
+                        cursor:"pointer", fontFamily:"inherit", padding:0, letterSpacing:1 }}>
+                      {doneProjectsOpen ? "▾" : "▸"} Завершённые ({doneProjects.length})
+                    </button>
+                    {doneProjectsOpen && (
+                      <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:5 }}>
+                        {doneProjects.map(proj => {
+                          const spent = spentByProject[proj.id] ?? 0;
+                          const doneDate = proj.completedAt
+                            ? new Date(proj.completedAt).toLocaleDateString("ru-RU", { day:"numeric", month:"short" })
+                            : null;
+                          return (
+                            <div key={proj.id} style={{ display:"flex", alignItems:"center", gap:5 }}>
+                              <span style={{ fontSize:10, color:"#4ADE80", flexShrink:0 }}>✓</span>
+                              <div style={{ minWidth:0 }}>
+                                <div style={{ fontSize:10, color:"var(--text-faint)", textDecoration:"line-through",
+                                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                  {proj.emoji} {proj.title}
+                                </div>
+                                <div style={{ fontSize:9, color:"var(--text-ghost)" }}>
+                                  {spent} ч{doneDate ? ` · ${doneDate}` : ""}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+              </div>
+            );
+          })()}
+
           <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:10 }}>ПО ТЕМАМ</div>
           {catStats.map(({ c, total, done }) => {
             const cat = CAT[c];
@@ -1840,10 +3094,10 @@ export default function StudyDashboard() {
             return (
               <div key={c} style={{ marginBottom:9 }}>
                 <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3, alignItems:"center" }}>
-                  <span style={{ fontSize:11, color: allDone ? cat.color : "var(--text-muted)" }}>
+                  <span style={{ fontSize:11, color: allDone ? cat.color : (theme==="light" ? "var(--text-secondary)" : "var(--text-muted)"), opacity:1 }}>
                     {cat.emoji} {cat.label}
                   </span>
-                  <span style={{ fontSize:9, color:"var(--text-faint)" }}>{done}/{total}</span>
+                  <span style={{ fontSize:9, color: theme==="light" ? "var(--text-muted)" : "var(--text-faint)" }}>{done}/{total}</span>
                 </div>
                 <div style={{ height:2.5, background:"var(--border)", borderRadius:2, overflow:"hidden" }}>
                   <div className="pf" style={{ height:"100%", width:`${p}%`, background:cat.color, opacity: allDone?1:0.7, borderRadius:2 }} />
@@ -1853,8 +3107,8 @@ export default function StudyDashboard() {
           })}
 
           {/* Side projects */}
-          <div style={{ marginTop:20, padding:12, background:"var(--bg-elevated)", borderRadius:8, border:"1px solid var(--border)" }}>
-            <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:8 }}>ПАРАЛЛЕЛЬНО</div>
+          <div style={{ marginTop:20, padding:12, background: theme==="light" ? "var(--bg-surface)" : "var(--bg-elevated)", borderRadius:8, border:"1px solid var(--border)" }}>
+            <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-muted)", marginBottom:8 }}>ПАРАЛЛЕЛЬНО</div>
             {[
               ["📖","GO Паттерны","в пути"],
               ["📖","Психология влияния","финал"],
@@ -1863,9 +3117,9 @@ export default function StudyDashboard() {
               ["💻","EventManager","20–30ч/нед"],
               ["🏃","Спорт","утром ~2ч"],
             ].map(([e,n,s]) => (
-              <div key={n} style={{ fontSize:10, color:"var(--text-secondary)", marginBottom:5, lineHeight:1.4 }}>
-                {e} <span style={{ color:"var(--text-muted)" }}>{n}</span>
-                <span style={{ fontSize:9, color:"var(--text-faint)", display:"block", paddingLeft:16 }}>{s}</span>
+              <div key={n} style={{ fontSize:10, color:"var(--text-secondary)", marginBottom:5, lineHeight:1.4, opacity:1 }}>
+                {e} <span style={{ color: theme==="light" ? "var(--text-secondary)" : "var(--text-muted)" }}>{n}</span>
+                <span style={{ fontSize:9, color: theme==="light" ? "var(--text-muted)" : "var(--text-faint)", display:"block", paddingLeft:16 }}>{s}</span>
               </div>
             ))}
             {userBooks.map(book => {
@@ -1897,15 +3151,21 @@ export default function StudyDashboard() {
           </div>
 
           {/* Legend */}
-          <div style={{ marginTop:12, padding:10, background:"var(--bg-elevated)", borderRadius:8, border:"1px solid var(--border)" }}>
-            <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-faint)", marginBottom:8 }}>ПАРЫ</div>
-            {[
+          <div style={{ marginTop:12, padding:10, background: theme==="light" ? "var(--bg-surface)" : "var(--bg-elevated)", borderRadius:8, border:"1px solid var(--border)" }}>
+            <div style={{ fontSize:9, letterSpacing:3, color:"var(--text-muted)", marginBottom:8 }}>ПАРЫ</div>
+            {(theme==="light" ? [
+              ["обязательно!","rgba(240,196,176,0.3)","#B05830"],
+              ["читать","rgba(168,216,204,0.3)","#2A7A68"],
+              ["50/50 читать","rgba(184,168,216,0.25)","#6040A0"],
+              ["работать на компе","rgba(168,200,232,0.3)","#304E80"],
+              ["пропустить","rgba(232,180,192,0.25)","#A03050"],
+            ] : [
               ["обязательно!","rgba(255,165,0,0.15)","#FFA500"],
               ["читать","rgba(74,222,128,0.12)","#4ADE80"],
               ["50/50 читать","rgba(253,224,71,0.12)","#FDE047"],
               ["работать на компе","rgba(34,211,238,0.12)","#22D3EE"],
               ["пропустить","rgba(255,107,107,0.12)","#FF6B6B"],
-            ].map(([label,bg,color]) => (
+            ]).map(([label,bg,color]) => (
               <div key={label} style={{ display:"inline-flex", alignItems:"center", marginRight:6, marginBottom:4 }}>
                 <span style={{ fontSize:9, padding:"1px 5px", borderRadius:3, background:bg, color, whiteSpace:"nowrap" }}>{label}</span>
               </div>
@@ -1917,9 +3177,74 @@ export default function StudyDashboard() {
         <div style={{ flex:1, minWidth:0 }}>
 
           {/* ── TAB: BY DAYS ── */}
-          {tab === "days" && (
-            <div style={{ display:"grid", gap:8 }}>
-              {DAYS.map(day => {
+          {tab === "days" && (() => {
+            // Month navigation helpers
+            const allMonths = ALL_MONTHS;
+            const monthIdx  = allMonths.indexOf(currentMonth);
+            const prevMonth = allMonths[monthIdx - 1] ?? null;
+            const nextMonth = allMonths[monthIdx + 1] ?? null;
+            const RU_MONTHS = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"];
+            const [yr, mo] = currentMonth.split("-").map(Number);
+            const monthLabel = `${RU_MONTHS[mo - 1]} ${yr}`;
+
+            const goMonth = (m) => {
+              setCurrentMonth(m);
+              try { window.storage?.setItem?.("current_month_v1", m); } catch {}
+            };
+
+            const activeDays = generateDays(currentMonth);
+
+            // Month progress: tasks from activeDays only
+            const monthTaskIds = [...new Set(activeDays.flatMap(d => d.taskIds))];
+            const monthDone    = monthTaskIds.filter(id => completed.has(id)).length;
+            const monthTotal   = monthTaskIds.length;
+            const monthPct     = monthTotal > 0 ? Math.round(monthDone / monthTotal * 100) : 0;
+
+            // bookIndex: sequential index among commute-days (days with uni), full DAYS for stability
+            const bookIndexByDate = {};
+            let commuteIdx = 0;
+            for (const d of DAYS) { if (d.uni?.length > 0) bookIndexByDate[d.date] = commuteIdx++; }
+
+            const btnBase = { padding:"4px 10px", borderRadius:6, border:"1px solid var(--border)",
+              background:"transparent", cursor:"pointer", fontFamily:"inherit", fontSize:13,
+              color:"var(--text-secondary)", lineHeight:1 };
+            const btnDisabled = { ...btnBase, opacity:0.3, cursor:"default" };
+
+            // Week view helpers
+            const _wd = (ds, n) => { const d = new Date(ds+"T00:00:00"); d.setDate(d.getDate()+n); return d.toISOString().split("T")[0]; };
+            const weekEndDate = _wd(currentWeekStart, 6);
+            const prevWeekStart = _wd(currentWeekStart, -7);
+            const nextWeekStart = _wd(currentWeekStart, 7);
+            const canGoPrev = DAYS.some(d => d.date >= prevWeekStart && d.date <= _wd(prevWeekStart, 6));
+            const canGoNext = DAYS.some(d => d.date >= nextWeekStart);
+            const weekDays = DAYS.filter(d => d.date >= currentWeekStart && d.date <= weekEndDate);
+            const [,wsm, wsd] = currentWeekStart.split("-").map(Number);
+            const [,wem, wed] = weekEndDate.split("-").map(Number);
+            const RU_MONTHS_SHORT = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+            const weekLabel = wsm === wem
+              ? `${wsd}–${wed} ${RU_MONTHS_SHORT[wsm-1]}`
+              : `${wsd} ${RU_MONTHS_SHORT[wsm-1]} – ${wed} ${RU_MONTHS_SHORT[wem-1]}`;
+            const goWeek = (ws) => setCurrentWeekStart(ws);
+            const goToday = () => {
+              const t = new Date(); const dow = t.getDay();
+              const m = new Date(t); m.setDate(t.getDate()-(dow===0?6:dow-1));
+              setCurrentWeekStart(m.toISOString().split("T")[0]);
+            };
+            const switchCalendarView = (v) => {
+              setCalendarView(v);
+              try { window.storage?.setItem?.("calendar_view_v1", v); } catch {}
+            };
+            const weekStats = (() => {
+              let studyH = 0, workH = 0, tasksDone = 0;
+              for (const day of weekDays) {
+                studyH += day.freeH;
+                workH += Math.round(Object.values(getWorkHoursForDay(day.date)).reduce((s,h)=>s+h,0)*10)/10;
+                tasksDone += day.taskIds.filter(id => completed.has(id)).length;
+              }
+              return { studyH, workH, tasksDone };
+            })();
+
+            const renderDayCard = (day) => {
                 const tasks = day.taskIds.map(id => TASK_MAP[id]).filter(Boolean);
                 const dayUserTasks = userTasks.filter(t =>
                   (t.type === "day" && t.date === day.date) ||
@@ -1935,6 +3260,27 @@ export default function StudyDashboard() {
                 const isOpen  = expanded.has(day.date);
                 const totalEstDay = tasks.reduce((s,t) => s+t.est, 0);
                 const allDone = dayPct === 100 && tasks.length > 0;
+
+                // Timeline
+                const dayView = dayViews[day.date] ?? "tasks";
+                const dayOfWeek = new Date(day.date + "T00:00:00").getDay();
+                const hasSport = settings.hasSportDays.includes(dayOfWeek);
+                const bookIdx = bookIndexByDate[day.date] ?? 0;
+                const workForDay = getWorkHoursForDay(day.date);
+                const workTasks = recurringWork
+                  .map(w => ({ id: w.id, title: w.title, est: workForDay[w.id] ?? 0, color: w.color, taskType: "heavy" }))
+                  .filter(t => t.est > 0);
+                const allDayTasks = [
+                  ...tasks.map(t => ({ ...t, color: CAT[t.cat]?.color })),
+                  ...workTasks,
+                ];
+                const timeline = isOpen ? buildDayTimeline(day, {
+                  wakeUpTime: settings.wakeUpTime,
+                  hasSport,
+                  books: userBooks,
+                  tasks: allDayTasks,
+                  bookIndex: bookIdx,
+                }) : [];
 
                 return (
                   <div key={day.date} className="day-card tr"
@@ -1967,14 +3313,22 @@ export default function StudyDashboard() {
                             {day.dow}, {day.short} {["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"][+day.date.split("-")[1]-1]}
                           </span>
                           <span style={{ fontSize:8, padding:"1px 5px", borderRadius:3, letterSpacing:1,
-                            background: day.wn==="ЗН"?"rgba(34,211,238,0.1)":"rgba(192,132,252,0.1)",
-                            color: day.wn==="ЗН"?"#22D3EE":"#C084FC" }}>
+                            background: day.wn==="ЗН"
+                              ? (theme==="light"?"rgba(168,200,232,0.25)":"rgba(34,211,238,0.1)")
+                              : (theme==="light"?"rgba(180,160,216,0.25)":"rgba(192,132,252,0.1)"),
+                            color: day.wn==="ЗН"
+                              ? (theme==="light"?"#4A78A8":"#22D3EE")
+                              : (theme==="light"?"#7060A8":"#C084FC") }}>
                             {day.wn}
                           </span>
                           {isToday && <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3, background:"rgba(74,222,128,0.15)", color:"#4ADE80", letterSpacing:1 }}>СЕГОДНЯ</span>}
                           {allDone && <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3, background:"rgba(74,222,128,0.1)", color:"#4ADE80" }}>✓ ГОТОВО</span>}
-                          {day.uni.length > 0 && <span style={{ fontSize:9, color:"var(--text-faint)" }}>🎓 {day.uni.length} пар.</span>}
-                          <span style={{ fontSize:9, color:"var(--text-faint)" }}>~{totalEstDay}ч задач</span>
+                          {day.uni.length > 0 && <span style={{ fontSize:9, color: theme==="light" ? "var(--text-muted)" : "var(--text-faint)" }}>🎓 {day.uni.length} пар.</span>}
+                          <span style={{ fontSize:9, color: theme==="light" ? "var(--text-muted)" : "var(--text-faint)" }}>~{totalEstDay}ч задач</span>
+                          {(() => {
+                            const wh = Object.values(getWorkHoursForDay(day.date)).reduce((s, h) => s + h, 0);
+                            return wh > 0 ? <span style={{ fontSize:9, color:"var(--text-muted)" }}>💻 {wh}ч</span> : null;
+                          })()}
                           <span style={{ fontSize:8, padding:"1px 6px", borderRadius:3,
                             background:"rgba(34,211,238,0.08)", color:"#22D3EE",
                             letterSpacing:0.5, whiteSpace:"nowrap" }}>
@@ -1984,9 +3338,9 @@ export default function StudyDashboard() {
                         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
                           <div style={{ flex:1, height:2.5, background:"var(--border)", borderRadius:2, overflow:"hidden" }}>
                             <div style={{ height:"100%", width:`${dayPct}%`, borderRadius:2,
-                              background: allDone?"#4ADE80":"#4A4AAA", transition:"width .4s" }} />
+                              background: allDone?"#4ADE80":(theme==="light"?"#7060A8":"#4A4AAA"), transition:"width .4s" }} />
                           </div>
-                          <span style={{ fontSize:9, color:"var(--text-faint)", flexShrink:0 }}>{doneTasks.length}/{tasks.length}</span>
+                          <span style={{ fontSize:9, color: theme==="light" ? "var(--text-muted)" : "var(--text-faint)", flexShrink:0 }}>{doneTasks.length}/{tasks.length}</span>
                         </div>
                       </div>
 
@@ -1996,10 +3350,50 @@ export default function StudyDashboard() {
 
                     {/* ─ Expanded ─ */}
                     {isOpen && (
-                      <div style={{ borderTop:"1px solid var(--border-subtle)" }}>
+                      <div style={{ borderTop:"1px solid var(--border-subtle)", background: theme==="light" ? "var(--bg-surface)" : undefined }}>
+
+                        {/* ─ View tabs ─ */}
+                        <div style={{ display:"flex", gap:0, padding:"8px 14px 0", borderBottom:"1px solid var(--border-subtle)" }}>
+                          {[["🕐 Мой день","timeline"],["✅ Задачи","tasks"]].map(([label, view]) => (
+                            <button key={view}
+                              onClick={() => setDayViews(prev => ({ ...prev, [day.date]: view }))}
+                              style={{
+                                padding:"4px 12px", fontSize:10, cursor:"pointer", fontFamily:"inherit",
+                                border:"1px solid var(--border)", borderBottom:"none",
+                                borderRadius: view === "timeline" ? "6px 0 0 0" : "0 6px 0 0",
+                                background: dayView === view ? "var(--bg-elevated)" : "transparent",
+                                color: dayView === view ? "var(--text-primary)" : "var(--text-muted)",
+                                marginBottom:-1, position:"relative", zIndex: dayView === view ? 1 : 0,
+                              }}>
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* ─ Timeline view ─ */}
+                        {dayView === "timeline" && (
+                          <div style={{ padding:"16px 14px 12px", borderBottom:"1px solid var(--border-subtle)" }}>
+                            <DayTimeline
+                              blocks={timeline}
+                              theme={theme}
+                              onBlockClick={(block) => {
+                                setDayViews(prev => ({ ...prev, [day.date]: "tasks" }));
+                                setHighlightTask({ id: block.taskId, date: day.date });
+                                setTimeout(() => {
+                                  const el = document.querySelector(`[data-task-id="${block.taskId}"]`);
+                                  el?.scrollIntoView({ behavior:"smooth", block:"center" });
+                                }, 50);
+                                setTimeout(() => setHighlightTask(null), 600);
+                              }}
+                            />
+                          </div>
+                        )}
+
+                        {/* ─ Tasks view ─ */}
+                        {dayView === "tasks" && <>
 
                         {/* Tip */}
-                        <div style={{ padding:"8px 14px", background:"var(--bg-base)", fontSize:11, color:"var(--text-muted)", lineHeight:1.6, borderBottom:"1px solid var(--border-subtle)" }}>
+                        <div style={{ padding:"8px 14px", background: theme==="light" ? "var(--bg-elevated)" : "var(--bg-base)", fontSize:11, color:"var(--text-muted)", lineHeight:1.6, borderBottom:"1px solid var(--border-subtle)", borderLeft: theme==="light" ? "3px solid var(--accent-lavender)" : "none" }}>
                           💡 {day.tip}
                         </div>
 
@@ -2012,8 +3406,8 @@ export default function StudyDashboard() {
                                 const bs = badgeStyle(cls.badge, theme);
                                 return (
                                   <div key={i} style={{ display:"flex", alignItems:"center", gap:5, fontSize:10 }}>
-                                    <span style={{ color:"var(--text-faint)" }}>{cls.time}</span>
-                                    <span style={{ color:"var(--text-muted)" }}>{cls.name}</span>
+                                    <span style={{ color: theme==="light" ? "var(--text-secondary)" : "var(--text-faint)" }}>{cls.time}</span>
+                                    <span style={{ color: theme==="light" ? "var(--text-secondary)" : "var(--text-muted)" }}>{cls.name}</span>
                                     <span style={{ fontSize:9, padding:"1px 5px", borderRadius:3,
                                       background:bs.bg, color:bs.color }}>{cls.badge}</span>
                                   </div>
@@ -2079,10 +3473,13 @@ export default function StudyDashboard() {
                             const cat = CAT[task.cat];
                             const done = completed.has(task.id);
                             const dayIds = tasks.map(t => t.id);
+                            const isHighlighted = highlightTask?.id === task.id && highlightTask?.date === day.date;
                             return (
-                              <div key={task.id} className="task-row tr"
+                              <div key={task.id} data-task-id={task.id} className="task-row tr"
                                 style={{ display:"flex", alignItems:"flex-start", gap:9, padding:"5px 7px",
-                                  borderRadius:6, cursor:"pointer" }}
+                                  borderRadius:6, cursor:"pointer",
+                                  boxShadow: isHighlighted ? "inset 0 0 0 2px rgba(129,140,248,0.6)" : "none",
+                                  transition:"box-shadow 0.5s" }}
                                 onClick={e => handleToggle(e, task.id, dayIds)}>
                                 <div className={`cbx${done?" on":""}`}
                                   style={{ marginTop:2, background: done?cat.color:"transparent" }}>
@@ -2126,6 +3523,60 @@ export default function StudyDashboard() {
                               </button>
                             </div>
                           ))}
+                          {/* Work blocks */}
+                          {(() => {
+                            const workForDay = getWorkHoursForDay(day.date);
+                            const activeWork = recurringWork.filter(w => (workForDay[w.id] ?? 0) > 0);
+                            if (!activeWork.length) return null;
+                            return (
+                              <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid var(--border-subtle)" }}>
+                                <div style={{ fontSize:8, letterSpacing:3, color:"var(--text-ghost)", marginBottom:8 }}>💼 РАБОТА</div>
+                                {activeWork.map(work => {
+                                  const hours = workForDay[work.id];
+                                  const dailyTarget = work.weeklyHours / 5;
+                                  const pct = Math.min(100, Math.round(hours / dailyTarget * 100));
+                                  const blockKey = `${work.id}_${day.date}`;
+                                  const done = completedWorkBlocks.has(blockKey);
+                                  const isEditing = workEdit?.workId === work.id && workEdit?.date === day.date;
+                                  return (
+                                    <div key={work.id} style={{ display:"flex", alignItems:"center", gap:9, padding:"4px 7px", borderRadius:6, cursor:"pointer", opacity: done ? 0.55 : 1 }}
+                                      onClick={e => !isEditing && handleWorkBlockToggle(e, work, day.date, hours)}>
+                                      <div className={`cbx${done?" on":""}`}
+                                        style={{ background: done ? work.color : "transparent", flexShrink:0 }}>
+                                        {done && <span style={{ fontSize:9, color:"#000", fontWeight:700 }}>✓</span>}
+                                      </div>
+                                      <div style={{ flex:1 }}>
+                                        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:3 }}>
+                                          <span style={{ display:"inline-block", width:6, height:6, borderRadius:"50%", background:work.color, flexShrink:0 }} />
+                                          <span style={{ fontSize:12, color: done ? "var(--text-faint)" : "var(--text-primary)", textDecoration: done ? "line-through" : "none", lineHeight:1.4 }}>
+                                            {work.title}
+                                          </span>
+                                          <span style={{ fontSize:9, color:"var(--text-faint)" }}>— {hours}ч</span>
+                                        </div>
+                                        <div style={{ height:2, background:"var(--border)", borderRadius:2, overflow:"hidden", maxWidth:120 }}>
+                                          <div className="pf" style={{ height:"100%", width:`${pct}%`, background:work.color, borderRadius:2, opacity:0.7 }} />
+                                        </div>
+                                      </div>
+                                      <button onClick={e => { e.stopPropagation(); setWorkEdit(isEditing ? null : { workId: work.id, date: day.date, value: hours }); }}
+                                        style={{ background:"none", border:"none", cursor:"pointer", fontSize:11, color:"var(--text-muted)", padding:"2px 4px", flexShrink:0, lineHeight:1 }}
+                                        title="Скорректировать часы">✏️</button>
+                                      {isEditing && (
+                                        <div style={{ display:"flex", alignItems:"center", gap:4 }} onClick={e => e.stopPropagation()}>
+                                          <input type="number" min="0" max="12" step="0.5"
+                                            value={workEdit.value}
+                                            onChange={e => setWorkEdit(prev => ({ ...prev, value: +e.target.value }))}
+                                            style={{ width:48, padding:"2px 4px", borderRadius:4, border:"1px solid var(--border)", background:"var(--bg-elevated)", color:"var(--text-primary)", fontSize:11, fontFamily:"inherit" }} />
+                                          <button onClick={() => { setWeekOverride(getWeekKeyStr(day.date), work.id, workEdit.value); setWorkEdit(null); }}
+                                            style={{ padding:"2px 8px", borderRadius:4, border:"none", background:work.color, color:"#000", fontSize:10, fontWeight:700, cursor:"pointer", fontFamily:"inherit" }}>✓</button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })()}
+
                           {daySessions.length > 0 && (
                             <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid var(--bg-card)" }}>
                               <div style={{ fontSize:8, letterSpacing:3, color:"var(--text-ghost)", marginBottom:6 }}>⏱ ЗАПЛАНИРОВАНО АВТОМАТИЧЕСКИ</div>
@@ -2155,13 +3606,75 @@ export default function StudyDashboard() {
                             </div>
                           )}
                         </div>
+
+                        </>}
                       </div>
                     )}
                   </div>
                 );
-              })}
+            };
+
+            return (
+            <div style={{ display:"grid", gap:8 }}>
+
+              {/* View switcher */}
+              <div style={{ display:"flex", gap:4, marginBottom:2 }}>
+                {[["📅 Месяц","month"],["📆 Неделя","week"]].map(([label, v]) => (
+                  <button key={v} onClick={() => switchCalendarView(v)}
+                    style={{ padding:"5px 12px", fontSize:11, cursor:"pointer", fontFamily:"inherit",
+                      borderRadius:6, border:"1px solid var(--border)",
+                      background: calendarView === v ? "var(--bg-elevated)" : "transparent",
+                      color: calendarView === v ? "var(--text-primary)" : "var(--text-muted)",
+                      fontWeight: calendarView === v ? 600 : 400 }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {/* ── MONTH MODE ── */}
+              {calendarView === "month" && <>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
+                  <button style={prevMonth ? btnBase : btnDisabled} disabled={!prevMonth}
+                    onClick={() => prevMonth && goMonth(prevMonth)}>←</button>
+                  <span style={{ flex:1, textAlign:"center", fontSize:13, fontWeight:600,
+                    color:"var(--text-primary)" }}>{monthLabel}</span>
+                  <button style={nextMonth ? btnBase : btnDisabled} disabled={!nextMonth}
+                    onClick={() => nextMonth && goMonth(nextMonth)}>→</button>
+                </div>
+                <div style={{ fontSize:11, color:"var(--text-muted)", marginBottom:4, paddingLeft:2 }}>
+                  Выполнено в {RU_MONTHS[mo - 1].toLowerCase()}:{" "}
+                  <span style={{ color:"var(--text-primary)" }}>{monthDone} / {monthTotal}</span> задач · {monthPct}%
+                </div>
+                {activeDays.map(renderDayCard)}
+              </>}
+
+              {/* ── WEEK MODE ── */}
+              {calendarView === "week" && <>
+                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
+                  <button style={canGoPrev ? btnBase : btnDisabled} disabled={!canGoPrev}
+                    onClick={() => canGoPrev && goWeek(prevWeekStart)}>←</button>
+                  <span style={{ flex:1, textAlign:"center", fontSize:13, fontWeight:600,
+                    color:"var(--text-primary)" }}>{weekLabel}</span>
+                  <button style={{ ...btnBase, fontSize:11, padding:"4px 8px" }}
+                    onClick={goToday}>Сегодня</button>
+                  <button style={canGoNext ? btnBase : btnDisabled} disabled={!canGoNext}
+                    onClick={() => canGoNext && goWeek(nextWeekStart)}>→</button>
+                </div>
+                <div style={{ fontSize:11, color:"var(--text-muted)", marginBottom:4, paddingLeft:2 }}>
+                  📚 {weekStats.studyH}ч учёбы · 💻 {weekStats.workH}ч работы · ✅ {weekStats.tasksDone} задач · 🔥 {streak}
+                </div>
+                <div className="week-scroll" style={{ display:"flex", gap:8, overflowX:"auto", paddingBottom:4 }}>
+                  {weekDays.map(day => (
+                    <div key={day.date} style={{ minWidth:260, flex:"0 0 260px" }}>
+                      {renderDayCard(day)}
+                    </div>
+                  ))}
+                </div>
+              </>}
+
             </div>
-          )}
+            );
+          })()}
 
           {/* ── TAB: ALL TASKS ── */}
           {tab === "all" && (
@@ -2245,11 +3758,23 @@ export default function StudyDashboard() {
             const LEVEL_EMOJI  = { junior:"🌱", middle:"⚡", senior:"🔥", techlead:"🚀", staff:"💎", principal:"👑" };
             const LEVEL_COLOR  = { junior:"#4ADE80", middle:"#22D3EE", senior:"#818CF8", techlead:"#F9A8D4", staff:"#FFD93D", principal:"#FF6B6B" };
             const LEVEL_IDS    = ["junior","middle","senior","techlead","staff","principal"];
-            const ACH_COLOR    = { sql_master:"#FFD93D", kafka_producer:"#FF8C42", container_queen:"#22D3EE", architect:"#F9A8D4", streak_7:"#FF6B6B", bookworm:"#4ADE80", sprint_slayer:"#818CF8" };
+            const ACH_COLOR    = { sql_master:"#FFD93D", kafka_producer:"#FF8C42", container_queen:"#22D3EE", architect:"#F9A8D4", streak_7:"#FF6B6B", bookworm:"#4ADE80", sprint_slayer:"#818CF8", week_warrior:"#22D3EE" };
             const currIdx      = LEVEL_IDS.indexOf(level.id);
             const fromColor    = LEVEL_COLOR[level.id];
             const toColor      = LEVEL_COLOR[LEVEL_IDS[currIdx + 1]] ?? fromColor;
             const totalDoneH   = TASKS.filter(t => completed.has(t.id)).reduce((s, t) => s + t.est, 0);
+            const totalWorkDoneH = (() => {
+              let h = 0;
+              for (const work of recurringWork) {
+                for (const alloc of Object.values(allWeekAllocations)) {
+                  const dateMap = alloc[work.id] || {};
+                  for (const [dateStr, hours] of Object.entries(dateMap)) {
+                    if (completedWorkBlocks.has(`${work.id}_${dateStr}`)) h += hours;
+                  }
+                }
+              }
+              return Math.round(h * 10) / 10;
+            })();
 
             return (
               <div style={{ padding:"4px 0 24px" }}>
@@ -2276,7 +3801,8 @@ export default function StudyDashboard() {
                   {[
                     ["🔥", streak, "дней подряд"],
                     ["✅", TASKS.filter(t => completed.has(t.id)).length, "задач выполнено"],
-                    ["⏱", Math.round(totalDoneH * 10) / 10 + "ч", "изучено"],
+                    ["📖", Math.round(totalDoneH * 10) / 10 + "ч", "изучено"],
+                    ["💼", totalWorkDoneH + "ч", "рабочих часов"],
                   ].map(([icon, val, label]) => (
                     <div key={label} style={{ flex:1, background:"var(--bg-card)", border:"1px solid var(--border)",
                       borderRadius:10, padding:"14px 10px", textAlign:"center", boxShadow:"var(--shadow-card)" }}>
@@ -2322,6 +3848,80 @@ export default function StudyDashboard() {
               </div>
             );
           })()}
+
+          {/* ── TAB: ANALYTICS ── */}
+          <Suspense fallback={<div style={{ color:"var(--text-faint)", fontSize:12, padding:24 }}>Загрузка...</div>}>
+          {tab === "analytics" && (() => {
+            const completedCount = analyticsData.summary.completionRate > 0
+              || analyticsData.summary.totalHoursLearned > 0
+              || analyticsData.summary.totalHoursWorked > 0
+              ? 1 : 0;
+
+            if (completedCount === 0) {
+              return (
+                <div style={{ textAlign:"center", padding:"60px 20px" }}>
+                  <div style={{ fontSize:64, marginBottom:16 }}>📊</div>
+                  <div style={{ fontSize:14, color:"var(--text-muted)" }}>
+                    Начни выполнять задачи — здесь появится твоя аналитика
+                  </div>
+                </div>
+              );
+            }
+
+            const activeDaysCount = (analyticsData.dailyActivity ?? [])
+              .filter(d => d.hoursLearned + d.hoursWorked > 0).length;
+
+            return (
+              <div style={{ display:"flex", flexDirection:"column", gap:28, paddingBottom:32 }}>
+
+                {/* 1. Summary cards */}
+                <SummaryStats
+                  summary={analyticsData.summary}
+                  weeklyProgress={analyticsData.weeklyProgress}
+                  theme={theme}
+                />
+
+                {/* 2. Weekly + category charts */}
+                <div>
+                  <div style={{ fontSize:13, fontWeight:600, color:"var(--text-muted)",
+                    textTransform:"uppercase", letterSpacing:1, marginBottom:14 }}>
+                    Прогресс обучения
+                  </div>
+                  {/* Pass only weeklyProgress + categoryProgress — heatmap rendered separately */}
+                  <AnalyticsCharts
+                    data={{ ...analyticsData, dailyActivity: [] }}
+                    theme={theme}
+                  />
+                </div>
+
+                {/* 3. Activity heatmap */}
+                <div>
+                  <div style={{ fontSize:13, fontWeight:600, color:"var(--text-muted)",
+                    textTransform:"uppercase", letterSpacing:1, marginBottom:14 }}>
+                    Активность
+                  </div>
+                  <AnalyticsCharts
+                    data={{ weeklyProgress:[], categoryProgress:[], dailyActivity: analyticsData.dailyActivity, readingProgress:[] }}
+                    theme={theme}
+                  />
+                  <div style={{ fontSize:11, color:"var(--text-muted)", marginTop:8 }}>
+                    Всего активных дней: {activeDaysCount}
+                  </div>
+                </div>
+
+                {/* 4. Books */}
+                <div>
+                  <div style={{ fontSize:13, fontWeight:600, color:"var(--text-muted)",
+                    textTransform:"uppercase", letterSpacing:1, marginBottom:14 }}>
+                    Книги
+                  </div>
+                  <ReadingProgressPanel data={analyticsData} theme={theme} />
+                </div>
+
+              </div>
+            );
+          })()}
+          </Suspense>
         </div>
       </div>
 
@@ -2335,6 +3935,11 @@ export default function StudyDashboard() {
         isOpen={bookModalOpen}
         onClose={() => setBookModalOpen(false)}
         onSave={addUserBook}
+      />
+      <AddProjectModal
+        isOpen={projectModalOpen}
+        onClose={() => setProjectModalOpen(false)}
+        onSave={addProject}
       />
       <BulkScheduleModal
         isOpen={bulkOpen}
